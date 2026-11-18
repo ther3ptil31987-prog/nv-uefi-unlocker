@@ -14,7 +14,8 @@
 #                     needs exactly these two, without dragging Turing assets)
 #
 # Options (1:1 with the PowerShell twin's parameters):
-#   --family F        ad102 | ga102 | tu10x | tu11x | all | localhost, or a
+#   --family F        ad102[/ad10x] | ga102[/ga10x] | tu10x | tu11x | all |
+#                     localhost, or a
 #                     comma/semicolon list of those tokens ("30,40"; list =
 #                     exact set to build, the mixed-generation rig form)
 #                     (aliases rtx40/40, rtx30/30, rtx20/20, rtx16/16;
@@ -47,8 +48,8 @@
 #   -h | --help       this text
 #
 # Family notes (same as make-usbroot.ps1):
-#   ad102  RTX 40 series (Ada)          - no host prerequisites
-#   ga102  RTX 30 series (Ampere)       - kmod-verified upstream, no silicon
+#   ad102[/ad10x]  RTX 40 series (Ada)  - no host prerequisites
+#   ga102[/ga10x]  RTX 30 series (Ampere) - kmod-verified upstream, no silicon
 #                                         evidence for this EFI path yet
 #   tu10x  RTX 20 series (Turing)       - REQUIRES GSP-RM firmware mode on the
 #                     TARGET machine; the legacy path TDR-loops on the
@@ -286,13 +287,13 @@ for _tok in "${_fam_tokens[@]}"; do
     [ -n "$_tok" ] || continue
     _tok="${_tok,,}"
     case "$_tok" in
-        ad102|rtx40|40) _fam=ad102 ;;
-        ga102|rtx30|30) _fam=ga102 ;;
+        ad102|ad10x|rtx40|40) _fam=ad102 ;;
+        ga102|ga10x|rtx30|30) _fam=ga102 ;;
         tu10x|rtx20|20) _fam=tu10x ;;
         tu11x|rtx16|16) _fam=tu11x ;;
         all) WANT_ALL=1; continue ;;
         localhost) WANT_LOCAL=1; continue ;;
-        *) die "unknown family: '$_tok' (ad102 | ga102 | tu10x | tu11x | all | localhost, or a comma list such as 30,40)" ;;
+        *) die "unknown family: '$_tok' (ad102 | ad10x | ga102 | ga10x | tu10x | tu11x | all | localhost, or a comma list such as 30,40)" ;;
     esac
     case " ${WANTED[*]-} " in *" $_fam "*) ;; *) WANTED+=("$_fam") ;; esac
 done
@@ -804,8 +805,13 @@ for fam in "${FAMILIES[@]}"; do
             fi
             log "[generate] V67 AD102 four-write payload"
             assets_run generate-ad102 "$OUT/v67-ad102-four-plm.bin"
-            # gsp-sections emits the ELF section family name (ad10x); the loader
-            # looks the device family up as ad102.
+            # Naming bridge between two schemes: gsp-sections emits the ELF
+            # SECTION family name (ad10x = NVIDIA's generation-scoped
+            # signature name); the loader keys the device family as ad102
+            # (= provenance chip of the pinned booter chain, serving the
+            # whole 0x2600-0x28ff span - see loader asset_family). These
+            # copies are the whole bridge; the 10x-named exports themselves
+            # are deleted with the other intermediates below.
             cp -f "$OUT/fwimage_ad10x.bin" "$OUT/fwimage_ad102.bin"
             cp -f "$OUT/fwsignature_ad10x.bin" "$OUT/fwsignature_ad102.bin"
             expected+=(booter_load_ad102.bin gsp_boot_desc_ad102.bin gsp_boot_ad102.bin
@@ -884,6 +890,17 @@ expected+=("BOOTX64.EFI")
 # files (84 + 29 MB) would be pure dead weight on the stick.
 for elf in gsp_ga10x.bin gsp_tu10x.bin; do
     [ -f "$OUT/$elf" ] && rm -f -- "$OUT/$elf"
+done
+# The 10x-named gsp-sections exports are the SAME class of intermediate: they
+# carry the ELF's SECTION family names (ga10x/ad10x), but the loader resolves
+# every device to a *102/tu10x/tu11x family and reads only those names - the
+# copies above are the real stick files. On a ga102+ad102 root the family-
+# neutral .fwimage section is byte-identical under every name, so leaving the
+# two 10x-named images behind cost ~85 MB of the ~189 MB layout (36b4089
+# scoped the EXPORTS but never deleted these after the copy). tu11x is NOT in
+# this list: fwimage_tu11x.bin is a genuine loader name, not an intermediate.
+for sec in fwimage_ga10x.bin fwsignature_ga10x.bin fwimage_ad10x.bin fwsignature_ad10x.bin; do
+    [ -f "$OUT/$sec" ] && rm -f -- "$OUT/$sec"
 done
 
 # Firmware only auto-boots \EFI\BOOT\BOOTX64.EFI; a flat copy of $OUT leaves the
@@ -998,6 +1015,22 @@ install_copy() { # $1 = src root, $2 = target mountpoint -> 0 ok, 1 refused
         fi
     done < <(find "$src" -type f)
     [ "$bad" -eq 1 ] && return 1
+    # Narrow-list prune, marker-gated: intermediates that OLDER layouts
+    # shipped but this maker no longer produces - the 10x-named gsp-sections
+    # exports (byte-identical twins of the *102 images, ~85 MB on a ga102+
+    # ad102 stick) and the consumed GSP ELFs. Only ever these six names at
+    # the target root, and only after the copy verified clean; every other
+    # pre-existing file stays untouched (issue #73 contract).
+    if our_marker "$mp"; then
+        for stale in fwimage_ga10x.bin fwsignature_ga10x.bin \
+                     fwimage_ad10x.bin fwsignature_ad10x.bin \
+                     gsp_ga10x.bin gsp_tu10x.bin; do
+            if [ -f "$mp/$stale" ]; then
+                rm -f -- "$mp/$stale"
+                log "[install] pruned stale intermediate: $mp/$stale"
+            fi
+        done
+    fi
     log "[install] done: $total files ($copied written, $skipped already identical) -> $mp (SHA-256 read-back verified)"
     return 0
 }

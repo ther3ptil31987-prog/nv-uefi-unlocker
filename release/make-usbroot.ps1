@@ -25,8 +25,8 @@
 # ever created/resized/reformatted, and no NVRAM boot entry is written.
 #
 # -Family (default localhost):
-#   ad102 | rtx40 | 40   RTX 40 series (Ada)          - no Windows prerequisites
-#   ga102 | rtx30 | 30   RTX 30 series (Ampere)       - kmod-verified upstream,
+#   ad102 | ad10x | rtx40 | 40   RTX 40 series (Ada)    - no Windows prerequisites
+#   ga102 | ga10x | rtx30 | 30   RTX 30 series (Ampere) - kmod-verified upstream,
 #                                                     EFI path has no silicon evidence yet
 #   tu10x | rtx20 | 20   RTX 20 series (Turing)       - EXPECTS GSP firmware mode.
 #                        The script WARNS (never blocks) unless EnableGpuFirmware=1
@@ -129,6 +129,7 @@ $ProgressPreference = 'SilentlyContinue'
 # $Family is a list: `-Family 30,40` binds as two elements, and a single quoted
 # "30,40" is split here too, so both spellings work.
 $validFamilyTokens = @("ad102", "ga102", "tu10x", "tu11x", "all", "localhost",
+                       "ad10x", "ga10x",   # NVIDIA generation names as aliases
                        "rtx40", "rtx30", "rtx20", "rtx16", "40", "30", "20", "16")
 $familyTokens = @()
 foreach ($f in $Family) {
@@ -141,12 +142,12 @@ if ($familyTokens.Count -eq 0) { $familyTokens = @("localhost") }
 $normalizedTokens = @()
 foreach ($tok in $familyTokens) {
     if ($validFamilyTokens -notcontains $tok) {
-        throw ("unknown family: '{0}' (ad102 | ga102 | tu10x | tu11x | all | localhost, " -f $tok) +
-               "or a comma list such as 30,40)"
+        throw ("unknown family: '{0}' (ad102 | ad10x | ga102 | ga10x | tu10x | tu11x | " -f $tok) +
+               "all | localhost, or a comma list such as 30,40)"
     }
     $normalizedTokens += switch ($tok) {
-        { $_ -in "ad102", "rtx40", "40" } { "ad102" }
-        { $_ -in "ga102", "rtx30", "30" } { "ga102" }
+        { $_ -in "ad102", "ad10x", "rtx40", "40" } { "ad102" }
+        { $_ -in "ga102", "ga10x", "rtx30", "30" } { "ga102" }
         { $_ -in "tu10x", "rtx20", "20" } { "tu10x" }
         { $_ -in "tu11x", "rtx16", "16" } { "tu11x" }
         default { $tok }   # localhost | all pass through
@@ -806,10 +807,18 @@ function Resolve-ProvenBlob {
     ) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
     if (-not $blob) {
         $blob = Join-Path $script:Work $script:ProvenBlobName
-        # Same transport + hash gate as the pinned sources above; throws its
+        # Same transport + hash gate as the pinned sources above; records its
         # own verdict (transport failure vs wrong bytes) on total failure.
-        Get-PinnedFile -Name $script:ProvenBlobName -Urls $script:ProvenBlobUrls `
+        # The verdict MUST be captured: an uncaptured call emits its $true into
+        # THIS function's output stream, so the caller's "$blob = Resolve-
+        # ProvenBlob" receives @($true, $path) instead of the path. PowerShell
+        # then splices that array into the native command line as two argv
+        # entries, and assets.exe reads the literal path "True" -> "read: ...
+        # (os error 2)" on exactly the runs where the download happened (a
+        # cached blob skips this branch, which is why a re-run always works).
+        $fetched = Get-PinnedFile -Name $script:ProvenBlobName -Urls $script:ProvenBlobUrls `
             -Sha256 $script:ProvenBlobSrcSha256 -Dest $blob
+        if (-not $fetched) { Write-Host "[gate] $($script:ProvenBlobName) not fetched ($($script:LastPinnedKind): $($script:LastPinnedReason))" }
     }
     if (-not (Test-Path $blob)) {
         throw "could not fetch $($script:ProvenBlobName) from any pinned transport; drop the exact file (sha256 $($script:ProvenBlobSrcSha256)) into $($script:Work) and re-run"
@@ -872,8 +881,13 @@ foreach ($fam in $Families) {
             Write-Host "[generate] V67 AD102 four-write payload"
             & $AssetsExe generate-ad102 (Join-Path $Out "v67-ad102-four-plm.bin")
             if ($LASTEXITCODE) { throw "generate-ad102 failed" }
-            # gsp-sections emits the ELF section family name (ad10x); the loader
-            # looks the device family up as ad102.
+            # Naming bridge between two schemes: gsp-sections emits the ELF
+            # SECTION family name (ad10x = NVIDIA's generation-scoped
+            # signature name); the loader keys the device family as ad102
+            # (= provenance chip of the pinned booter chain, serving the
+            # whole 0x2600-0x28ff span - see loader asset_family). These
+            # copies are the whole bridge; the 10x-named exports themselves
+            # are deleted with the other intermediates below.
             Copy-Item (Join-Path $Out "fwimage_ad10x.bin")     (Join-Path $Out "fwimage_ad102.bin") -Force
             Copy-Item (Join-Path $Out "fwsignature_ad10x.bin") (Join-Path $Out "fwsignature_ad102.bin") -Force
             $expected += @(
@@ -965,6 +979,19 @@ foreach ($fam in $Families) {
 foreach ($elf in @("gsp_ga10x.bin", "gsp_tu10x.bin")) {
     $elfPath = Join-Path $Out $elf
     if (Test-Path $elfPath) { Remove-Item $elfPath -Force }
+}
+# The 10x-named gsp-sections exports are the SAME class of intermediate: they
+# carry the ELF's SECTION family names (ga10x/ad10x), but the loader resolves
+# every device to a *102/tu10x/tu11x family and reads only those names - the
+# copies above are the real stick files. On a ga102+ad102 root the family-
+# neutral .fwimage section is byte-identical under every name, so leaving the
+# two 10x-named images behind cost ~85 MB of the ~189 MB layout (36b4089
+# scoped the EXPORTS but never deleted these after the copy). tu11x is NOT in
+# this list: fwimage_tu11x.bin is a genuine loader name, not an intermediate.
+foreach ($sec in @("fwimage_ga10x.bin", "fwsignature_ga10x.bin",
+                   "fwimage_ad10x.bin", "fwsignature_ad10x.bin")) {
+    $secPath = Join-Path $Out $sec
+    if (Test-Path $secPath) { Remove-Item $secPath -Force }
 }
 
 $expected += "BOOTX64.EFI"
@@ -1123,6 +1150,23 @@ function Copy-UnlockRoot([string]$From, [string]$To) {
         Write-Host "[install] READ-BACK MISMATCH on $($To) - do not boot from this copy:"
         foreach ($b in $bad) { Write-Host "[install]   $b" }
         return $false
+    }
+    # Narrow-list prune, marker-gated: intermediates that OLDER layouts
+    # shipped but this maker no longer produces - the 10x-named gsp-sections
+    # exports (byte-identical twins of the *102 images, ~85 MB on a ga102+
+    # ad102 stick) and the consumed GSP ELFs. Only ever these six names at
+    # the target root, and only after the copy verified clean; every other
+    # pre-existing file stays untouched (issue #73 contract).
+    if ($ours) {
+        foreach ($stale in @("fwimage_ga10x.bin", "fwsignature_ga10x.bin",
+                             "fwimage_ad10x.bin", "fwsignature_ad10x.bin",
+                             "gsp_ga10x.bin", "gsp_tu10x.bin")) {
+            $stalePath = Join-Path $To $stale
+            if (Test-Path -LiteralPath $stalePath) {
+                Remove-Item -LiteralPath $stalePath -Force
+                Write-Host "[install] pruned stale intermediate: $stalePath"
+            }
+        }
     }
     $total = @(Get-ChildItem -LiteralPath $fromFull -Recurse -File).Count
     Write-Host ("[install] done: {0} files written ({1} refreshed), {2} already identical -> {3} (SHA-256 read-back verified)" -f
