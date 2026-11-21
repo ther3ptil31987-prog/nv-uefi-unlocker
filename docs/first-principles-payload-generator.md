@@ -80,6 +80,63 @@ canary 地址 0x6140；main SP 0xFFF0；fill 0x4A7
 
 ## 7. 立项草案（G0–G3）
 
+> **G0 已落地（2026-11-05，分支 falcon-booter-payload-gen，6d7a4dc/e75046d）**：
+> - 解码器：falcon.c 18 表 + core-dis.c 引擎语义全转写 Rust（tools/falcgen）；线性解码在**五份解密 booter 段上与 envydis lst 逐条零分歧**（TU102/TU116/GA102/AD102/GA100，54,670 条）+ 360 个非规范偏移逐点对拍（env-gated oracle 测试）。
+> - 扫描器：前向行走分类移植，**17/17 已知代码入口全中**——TU102 6/6（含 python 版 miss 的中项 0x10b9/0xc95）、GA102 5/5、AD102 6/6（0x31b5 status writer 形状正确：DmemStore+mailbox 立即数+LCall）。
+> - **G0 实证发现（2026-11-05 勘误）**：初判"envydis 表有编码空洞"**有误**——盲区是 **CRYPT 特性位未开启**（lst 生成时无 crypt）；开启 `F_CRYPT` 后五段 **零未知指令**，SEC 入口页解码为 `csigclr` + csecret/cxor 清密钥序列，全部 ??? 簇都是 cxset/cocmd 族密码指令。扫描器/解释器已改用 FUC5_CRYPT。cmp50hx 的"gadget PC 处 archive 字节≠运行时字节"独立成立（不同密钥流）。同日落地 **G1 Track B 窄解释器**（src/interp.rs）：明文喂入、MMIO 桩、DMA-as-copy；bring-up 至 41K 条真实指令，**main SP = 0xFFF0 已由解释器推导**（与 nlzy 表 golden 一致）+ SEC 入口 SP init 0xfffc / canary 0x6140 / park 0x7ea4 机械化推导。当前 frontier：mpush/mpopaddret 族 ABI 无公开文档（envytools branch.rst 自注 todo），booter 自身 canary 存储与返回槽关系的 bring-up 迭代进行中。
+> - 复评结论：G1 双轨并行（用户裁定）按原案启动；G2/G3 排程不变。
+>
+> **G1 Track B 重大推进（2026-11-07，497fc3b + 后续）**：解释器沿真实流程驱动至 XDMA 层，沿途修复**四个语义真 bug**（mpop 全恢复、adc/sbb 进位、ld/st 宽度、sethi 保低位）——每个 bug 都曾被流程当作"引导问题"而实际是模型错误。环境模型（全部从 booter 自身代码逆向，非猜测）：
+> - **安全服务邮箱**（IO 0xd000-0xd500）：0xd000 = 就绪/错误位（0x1c0000 就绪、0xc00000 错误）、0xd100 = 提交（id|0x10000 = 读型请求；写型 = 0xd200 载荷 + 0xd100 id，参数存入服务存储供写-验证回读）、0xd400 = 门铃/应答、0xd500 = 响应值。旧 GetParam id 表（0xa-0xe 使能、0x11 期望值、0x6-9 签名半块）**全部在描述符块结构中得到解释**（见下）。
+> - **PRI 读服务**（0xf27）：0x1c100 = 行选择、0x1c000 = 触发（0x800000f1 读/f2 写）、0x1c200 = 行数据——同时服务熔丝行和**活寄存器读**（WPR2 0x1fa824/28、FRTS 界 0x1fa81c/20、L2 熔丝 0x100ce0、修订对 0x20800/4）。
+> - **描述符块**（DMEM 0x600，块搬运器 0x2d5e 按尺寸类抽取字段）：头 u16@+2=2、+0x10 ≤0x200、**使能位 +0x814-0x81c（b16，类 0xa-0xe）**、期望值表 +0x820（计数 ≤0xb @+0x878）、+0x880-0x890 五个 u32 字段（类 0x12-0x16）、+0x414/+0x614 = 签名半块（类 0x5/0x6，≤0x200）。旧 id 表的 ctx 即此块。
+> - **meta 校验链**（状态码全部定位到检查点）：0x91 = (WPR2_HI-WPR2_LO)<<8+0x20000 == 1MiB（256B 单位）+ 0x11821c bit17；0x73 = L2 熔丝 (mask<<20)==meta.fbSize（TU102 = 11<<6）；0x8d = frtsSize 必须恰 1MiB + wprEnd-frts 关系；0x1b/0x1d/0xb 如上。**meta 种子已换为自洽的 TU102 11-GiB 布局**（fbSize=0x2c000000 驱动 L2 熔丝与堆公式）。
+> - **XDMA**（拷贝驱动 0x8070/分块器 0x532）：$xdbase = 页基址寄存器，xdld/xdst = 0x100 字节/块（op0 = 页内偏移，op1 = (aperture<<16)|源偏移），xdwait 完成。RM 镜像装入 GSP DMEM（>0x10000 地址）、radix 经 0xf00000 窗口构建。**签名 DMA 调用点已定位**：0x3924 函数（dst=0x600、0x1000 分块、源 = meta+0x48/4c，0x39bb）与 0x3f87 主路径（0x40cd，dst=0x5d00，"FREE"/"PAEH" 魔数校验）。
+> - 前沿：XDMA 模型落地后流程扰动（boot 镜像自装载覆盖 0x600 块——真实顺序=数据镜像含描述符块），快照点已通（sig-page 过滤 + 栈触及检测），待下一轮把装载顺序与描述符块来源对齐。
+>
+> **G1 几何闭环（2026-11-07 续）——活帧链从真实 trace 提取**：
+> - **签名 DMA 调用点实测**（10.4M 步 run，step 10419105）：`0x39bb lcall 0x532`，dst=0x600、src=meta+0x48（0x1e80000）、len=meta+0x50、**sp=0xff44**（0x3924 帧底）。
+> - **完整帧链（全部实证）**：main(sp 0xfff0)→…→0x7fe5 体(sp 0xffe0)→ORCH=0x231b 大编排函数（入口 sp 0xffd4、体 sp 0xff8c，ret@[0xffd4]）→**0x3924**（sp 0xff44，ret@[0xff88]）→0x532（sp 0xff38，canary@[0xff3c]、局部@[0xff38]，ret@[0xff40]）→**0x8070=XDMA 驱动**（sp 0xff14，mpush $r6+canary@[0xff30]，**ret@[0xff34]=首劫持槽**）。
+> - **劫持映射**：DMA 末块覆盖 0xFF00+ 后，0x8070 尾声读 canary@[0xff30]（=payload guard 值）、mpopaddret $r6 0x4 弹 r0..r6@[0xff14..0xff2c]（=payload 填的寄存器值）、pc=[0xff34]=首 gadget。
+> - **0x18 步长推导**：golden 链帧 = 5 寄存器槽 + gadget 槽——尾声 `mpopaddret $r4 <imm=0>`：pop r4..r0（guard@+0、value@+8→r2、addr@+C→r1、gadget@[+0x14]=pc），stride 恰 0x18。golden 的 guard = **canary 存于 r4 槽**（mpush $r4 形状的帧，canary 复用寄存器保存位）。
+> - **gadget 语义首个实解**：0x10B9 中项入口 = `mov $r14 0xffff`（4 字节）后并入规范流 `mov $r10 0x1103c0; lcall 0xe3b`（写 r11→GSP FBIF 窗口）——token = 中项入口注入小工作后落回宿主函数自身的尾声，级联消耗下一链帧。
+> - **关键流程发现**：0x3924 路径在 0x397f 校验 sig_size−1 ≤ 0xfff——**payload 的 sig_size=0xFA00 会被此路径拒绝**；ORCH 按 D[0x318+4] 等阶段旗标分支（0x27a2/0x282b/0x287e…），golden 流程走的是另一分支。**sig_size≤0x1000 与实测 payload 的矛盾 = 下一轮对齐点**（真实流程的 DMA 长度字段或分支待锁定）。
+> - **G1 验收状态**：main SP 0xFFF0 ✓（推导=实证）、copy base 0x600 ✓（sig DMA 实测）、canary 0x6140 ✓、park 0x7ea4 ✓；活帧槽位/步长的静态推导框架完成，0xFF38/40/44/4C 与 0xff34 的差异归因于流程分支——待分支锁定后逐项对拍。
+>
+> **sig_size 之谜定谳（2026-11-07 续）**：
+> - 驱动侧实锤（open-gpu-kernel-modules kernel_gsp.c `_kgspCreateSignatureMemdesc`）：stock 签名 = gsp_fw 容器的 `.fwsignature_*` 节，**对齐 256 后恰 = 0x1000 字节**（本地抽取的 fwsignature_ga10x/ad10x.bin 均 4096B 实证）。booter 的两处 cap（meta 校验 0x13b4 与 0x3924 的 0x397f，均为 sig_size−1 ≤ 0xfff 无符号）= **恰好卡在 stock 尺寸上的合法校验**，fuc5 的 a/b = 无符号比较（envytools branch.rst 明文）。
+> - **payload 模式（我们 loader 发 sig_size=0xFA00）在 TU102 build 的 meta 校验（0x13b4，ORCH 无条件先跑）即拒**——与 TU106 实机 payload 跑通的矛盾 = **golden 流程走 ORCH 另一分支或另一 meta 形状**，头号对齐点。
+> - **golden 活帧形状定案**（generate_v67.py 逐字核对）：waiter 帧 = mpush-$r4 类（5 寄存器槽+ret），**canary 存于 [sp+0]（r4 槽位，mpush 后覆写）**；尾声 `mpopaddret $r4 imm`：pop r4=guard@[sp]、r3、**r2=value@[sp+8]、r1=addr@[sp+C]**、r0，pc=[sp+0x14]=gadget，stride 恰 0x18。0x10B9 中项 gadget 首指令 = `mov $r14 0xffff`（4B）后并入规范流（写 0x1103c0 序列）。
+> - 我方 10.4M 实测链的 waiter = 0x8070（mpush-$r6 形状，首劫持槽 [0xff34]）——与 golden 差恰一个 0x18 帧：**golden 流程的 waiter 是另一个 mpush-$r4 函数**（ORCH 另一分支的 DMA 等待点）。锁分支 = G1 验收的最后一步。
+>
+> **golden 链机制全贯通（2026-11-07 收官）**：
+> - **FILL_DWORD = 0x4A7**（TU102 golden，generate_v67.py:33——GA102 的 0x19c 是另一族）；**guard = 0x6140** = canary 地址本身作值。
+> - **0x18 步长的尾声 = `mpopaddret $r3 0x4`**（booter 内 9 处，恰属 0x900/0x9a1/0x2b9b 类服务调用帧）：帧布局 [sp]=r3、[sp+4]=r2、[sp+8]=r1、[sp+C]=r0、[sp+0x10]=canary、[sp+0x14]=ret——pops r3..r0 后跳 +4 过 canary、pc=[sp+0x14]，**总展开恰 0x18**。
+> - **golden 活帧逐槽对拍成功**（sp = 0xFF38 的该形状帧）：r3=[0xFF38]=guard 值 0x6140、r2=[0xFF3C]=fill、r1=[0xFF40]=0xFFFFFFFF（value）、r0=[0xFF44]=0x409650（addr）、canary=[0xFF48]=fill 0x4A7 vs D[0x6140]=fill 0x4A7 **天然相等**（guard 不是 canary，是 token 的寄存器载荷！）、pc=[0xFF4C]=0x10B9。
+> - **canary 检查通过机制**：DMA 把 fill 0x4A7 铺满全帧，[0xFF48] 与 D[0x6140] 都是 fill——所有尾声检查**天然通过**，无需伪造 canary。**0x7a38 mismatch handler = mailbox0←0x47 自旋 park**（实机"永不 halt"的直接来源——mismatch 才 park，golden 不触发）。
+> - **0x10B9 token 宿主函数 = 写执行器**：body 消费寄存器值（`mov $r11 ← $r2; lcall 0xe3b(0x110040, r11)`、`mov $r11 ← $r1; ...`——r1/r2 = 链帧 pop 交付的 payload 值），尾声同为 mpopaddret $r3 0x4 → 级联下一链帧。token 族（0x10B9/0xCBD/0xC95/0xE85/0x1F89）= 各 helper 的中项入口，每个做一段初始化后用同一 0x18 尾声串下一帧。
+> - **G1 收官**：帧算法 ✓、gadget 层 ✓、栈几何（链机制+帧形状+寄存器映射）✓、黄金标准对拍的字段全部解释完毕。**G2 = synth.rs 落地**（写链 → 链帧布局 → 字节镜像）， TU102 golden b0ec9029 逐字节复现为验收。
+>
+> **G2 落地——TU102 golden 一次通过（2026-11-07，synth.rs）**：
+> - `falcgen synth --writes 0x409650=0xffffffff,0x1fa828=0 --golden v67-tu102-610.43.03.bin` → **BYTE-IDENTICAL ✓**（64000 字节，SHA 双方 = b0ec90294d1de3c67e024631c0a11000f281470d76eed806fc24c66b7fd1ef41）。
+> - golden 对照物本地可再生：cmpunlocker generate_v67.py + **本地 pinned 包（SHA e17e7c92… 与其 PACKAGE_SHA256 完全一致）**，WSL 内 zstd 解包。golden 文件不入库（资产纪律），对比走 CLI --golden 参数。
+> - synth.rs = 帧文法引擎（`Geometry` 参数化：fill/copy_base/guard/main_sp/活帧位/链基/步长/gadget 族/尾块级联常量/token 值），TU102 值全部来自本会话的 booter 逆向（fill=0x4A7 由译码器可推导=自循环类常量；gadget 地址=扫描器 G0 17/17 的产物；帧形状=trace 实证；尾块级联常量=逆向中的 helper 序列）。
+> - **诚实边界**：尾块级联常量（0x8E18/0xC95/0x1F89/0xE85/0x7EA4/0xCBD/0xFFFF token）的语义=部分逆向（mutex 释放级联），当前以 per-die 常量进 Geometry；**真正的第一性原理测试 = G3 TU116**（新 die 无 golden，几何全靠推导——PATCHED_WORDS_TU11X 对拍）。
+> - GA102（2a0aa1f8）/AD102（44c36b2d）复现 = 下一步（各需一份 Geometry + 本地包验证）。
+>
+> **GA102 / AD102 同步落地——三家 golden 全部逐字节复现（2026-11-07 续）**：
+> - **GA102**：`falcgen synth --family ga102 --writes 0x823804=0xffffffff` → SHA 2a0aa1f8… **BYTE-IDENTICAL ✓**（assets/out/v67-ga102.bin 哈希实证）。fill = **0x19c**（docs 的旧说法正确；先前 0x4A7 读数 = 十进制误读事故——0x19c 的十进制恰是 412）。单写模板 + 0x81ee 终止符，19 词 put-list。
+> - **AD102**：`falcgen synth --family ad102 --writes 0x1fa7cc=0xfffff0ff,0x9a0148=0xffffffff,0x1fa7c4=0xffffffff,0x823804=0xffffffff` → SHA 44c36b2d… **BYTE-IDENTICAL ✓**。四写链 put-list（含 marker 0x67b00001 与 0x31b5/0x771e 收尾对），帧族 gadget = 0x21b2/0x33fc/0x256f/0x7a02（docs 的 Ada gadget 表逐字吻合）。
+> - **两家 golden 均已在 assets/out**（v67-ga102.bin / v67-ad102-four-plm.bin，哈希与钉值一致）——无需再生成。
+> - **方法论修正**：GA/AD 的帧文法 ≠ TU102 的帧循环——GA-line/Ada booter 是自己的尾声形状，synth 以 **per-family put-list 模板**实现（写链槽位参数化）。"从明文推导 put-list" = 机械工作（对拍 fill 差分即得全部 put 位）。
+> - **G0→G2 全程序收官**：解码器（5 die 零分歧）→ 扫描器（17/17）→ 栈几何（链机制+帧形状）→ **合成（三家钉值 golden 逐字节复现）**。剩余 = G3：TU116 真第一性原理测试（无 golden，对拍 PATCHED_WORDS_TU11X 单字重锚）。
+>
+> **G3 落地——TU116 真第一性原理测试通过（2026-11-07 续，synth.rs Geometry::tu11x）**：
+> - **扫描器独立复现手工锚**：TU116_sec_plain.bin 上 `--check 0x10b9,0xcbd,0xc95,0xe85,0x1f89,0x7e9a,0x7ea4` 全 HIT——**park = 0x7e9a 由 [ParkSelf, LBra] 形状独立推出**（TU102 的 0x7ea4 在 TU116 上 = [MmioWrite..]，非 park）——单字重锚被第一性原理管道确认。
+> - **TU11X 钉值载荷逐字节复现**：`Geometry::tu11x()`（= TU102 文法 + park 0x7E9A）+ PLM/WPR2 写链 → SHA **c79208ac… = V67_TU11X_PAYLOAD_SHA256 钉值**（golden 文件由 PATCHED_WORDS_TU11X 重建后哈希核验）。
+> - **首个第一性原理产物（SS0/SS1 链）**：`synth --family tu11x --writes 0x409664=0x88888888,0x40966c=0x8` → SHA 1db35f51…；与钉值差异**恰四词**（0xFF40/44 = SS0 值/址、0xFF58/5C = SS1 值/址），guard/gadget/尾块/park 逐字节不动。
+> - **诚实注记**：Turing SS0/SS1 地址 = 0x409664/0x40966c（tx_booter.rs TU10X_FEAT_SS0/SS1，字段值 0x88888888/0x8 = SS0_UNLOCK/SS1_UNLOCK 实测常量）；**#6 发现"SS0/SS1 selectors follow host-side from the open PLM"**——不开 FEAT_PLM（0x409650）时寄存器写入落位（heavy-secure 上下文）但主机侧速率跟随与否未证——"其他不动"按字面执行，效果以读回为准（FEAT_READOUT_1 = 0x409668）。
+
 | 里程碑 | 内容 | 验收 | 估时 |
 |---|---|---|---|
 | G0 | 位置无关 fuc5 解码器（falcon.c 表→Rust）+ 扫描器完整化 | TU102 六站点 6/6、GA102/AD102 已知代码入口全中，envydis 交叉校验零分歧 | 3–5 天 |

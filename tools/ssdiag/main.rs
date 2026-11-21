@@ -1,4 +1,14 @@
-//! ssdiag v0.8.3 - in-OS NVIDIA register diagnosis + separate-lock re-apply.
+//! ssdiag v0.8.5 - in-OS NVIDIA register diagnosis + separate-lock re-apply.
+//! v0.8.5 fixes the tpc face semantics label (five-die SM-count check,
+//! #237 formula verification 2026-11-21): STATUS bit SET = TPC fused OFF,
+//! not present. The verdict lines already counted it this way (and matched
+//! GA102 82SM / GA106 28SM / AD107 24SM / AD102 128SM exactly); only the
+//! header and the const doc said the opposite.
+//! v0.8.4 renames the ex-L2_DEF_SCAN face to FBPA_TRIM with the round-5
+//! identity in the header (#237): 0x8211e8..0x8211fc is per-FBPA memory/PHY
+//! trim fuse data (consumer chain: app08 PC 0x3e00..0x3ffb merges into
+//! NV_PFB_FBPA_n + 0x3d50), so nobody hunts OPT_ROP_L2_DEFECTIVE_FBP here
+//! again - that hunt returns to OBJFUSE +0x248 only.
 //! v0.8.3 adds a read-only RTD3 policy line to the POWER block (issue #266):
 //! the per-adapter `EnableRuntimePowerManagement` DWORD under the NVIDIA
 //! display adapter's driver key, resolved at run time through the Enum key.
@@ -3720,13 +3730,15 @@ const ADA_FUSE_ROWS: [(&str, u32); 9] = [
     ("CTRL_OPT_9C8", 0x0082_09C8),
 ];
 /// Per-GPC TPC floorsweep surface. STATUS at 0x820c38+4g is the effective
-/// fused mask (bit n = TPC n of GPC g), CTRL at 0x820838+4g the writable
-/// override — exactly the pair nvgpu drives in tpc_gv11b.c (write CTRL, poll
-/// STATUS until equal), so the semantics are driver-sourced, not inferred.
-/// The OPT/DEFECT banks are printed raw: 0x820350/0x8205c4 are documented
-/// GPC-level masks (gpcprobe/Consensus-Protocol, 15-card validation), while
-/// a per-GPC assignment inside the banks is still probe-derived
-/// (KohakUnlock#16) — see docs/open-questions.md #13.
+/// fused mask — bit n SET = TPC n of GPC g fused OFF (five-die SM-count
+/// verified 2026-11-21: GA102 82SM/GA106 28SM/AD107 24SM/AD102 128SM exact;
+/// the verdict lines always counted it this way). CTRL at 0x820838+4g is the
+/// writable override — exactly the pair nvgpu drives in tpc_gv11b.c (write
+/// CTRL, poll STATUS until equal), so the pair semantics are driver-sourced,
+/// not inferred. The OPT/DEFECT banks are printed raw: 0x820350/0x8205c4 are
+/// documented GPC-level masks (gpcprobe/Consensus-Protocol, 15-card
+/// validation), while a per-GPC assignment inside the banks is still
+/// probe-derived (KohakUnlock#16) — see docs/open-questions.md #13.
 const TPC_CTRL_BASE: u32 = 0x0082_0838;
 const TPC_STATUS_BASE: u32 = 0x0082_0C38;
 const TPC_BANK_A: u32 = 0x0082_03A0;
@@ -3959,11 +3971,15 @@ const LTS_BROADCAST: u32 = 0x0017_E02C;
 const AD10X_L2_CAND_FBP: u32 = 0x0082_1200; // OPT_ROP_L2_DISABLE_FBP[0..5] (stage-1 fuse)
 const AD10X_L2_SW_FBP: u32 = 0x0082_2080; // CTRL_OPT_ROP_L2_FBP[0..5] (RPR 37-42, OBJFUSE +0x228)
 const AD10X_L2_EFF_FBP: u32 = 0x0082_2900; // STATUS_OPT_ROP_L2_FBP[0..5] (OBJFUSE +0x270)
-/// Ada's OPT_ROP_L2_DEFECTIVE_FBP hunt: caller 0x6c7334 reads OBJFUSE +0x228
-/// (-> 0x822080) then +0x248 for the companion mask it ANDs in - the array
-/// lives somewhere in 0x8211c0..0x821240 on the 4090 capture.
-const AD10X_L2_DEF_SCAN_BASE: u32 = 0x0082_11C0;
-const AD10X_L2_DEF_SCAN_WORDS: u32 = 33;
+/// Round-5 solve (was mislabeled the OPT_ROP_L2_DEFECTIVE_FBP hunt): the
+/// nonzero core 0x8211e8..0x8211fc is per-FBPA memory/PHY trim fuse data -
+/// JeusChrit's app08 consumer copy (PC 0x3e00..0x3ffb) merges into
+/// NV_PFB_FBPA_n + 0x3d50. Word counts scale 0/2/4 with populated FBPAs
+/// (per-card data, not a floorsweep mask); the 4090's six words
+/// f1/20/00/10/e1/10 are the AD102 reference row. DEFective-FBP hunting
+/// returns to OBJFUSE +0x248 only.
+const AD10X_FBPA_TRIM_BASE: u32 = 0x0082_11C0;
+const AD10X_FBPA_TRIM_WORDS: u32 = 33;
 /// app08 0x6ae4 source tables (what it WOULD write if the four gates pass):
 /// 0x821480..0x821584 and 0x822a48..0x822c44 - do they carry the 4090 slice
 /// pattern [0x0444/0x2044/0x0844/0x1044] or stay at the AD103 values?
@@ -4242,7 +4258,7 @@ fn decode_tpc_bits(v: u32) -> String {
 /// are fused off per GPC, and whether the affected GPC carries a defect bit.
 /// Nothing is written; the CTRL override path is out of scope.
 fn dump_tpc(rd: &dyn Fn(u32) -> u32) {
-    println!("--- tpc (per-GPC floorsweep; STATUS bit n = TPC n of that GPC) ---");
+    println!("--- tpc (per-GPC floorsweep; STATUS bit set = TPC fused OFF; SM-count verified 5-die 2026-11-21) ---");
     let mut off_total = 0u32;
     let mut off_mask = 0u32;
     let mut statuses = [0u32; TPC_MAX_GPC as usize];
@@ -4649,16 +4665,16 @@ fn dump_debug(rd: &dyn Fn(u32) -> u32, fam: &str) {
                 cell_val(e)
             );
         }
-        // #237 round 4 sweep: Ada's OPT_ROP_L2_DEFECTIVE_FBP hunt. The GA100
-        // dict had ROP_L2_DEFECTIVE at 0x8205e8; on Ada the 595 caller
-        // (0x6c7334) reads OBJFUSE +0x228 (-> 0x822080) then +0x248 for a
-        // companion mask it ANDs in - sweep the candidate window so the 4090
-        // capture locates the real array.
-        println!("  L2_DEF_SCAN (0x8211c0..0x821240; Ada OPT_ROP_L2_DEFECTIVE_FBP hunt, GA100 dict had 0x8205e8)");
-        for chunk in (0..AD10X_L2_DEF_SCAN_WORDS).step_by(8) {
-            print!("    {}", off_h(AD10X_L2_DEF_SCAN_BASE + chunk * 4));
-            for i in chunk..(chunk + 8).min(AD10X_L2_DEF_SCAN_WORDS) {
-                print!(" {}", cell_val(rd(AD10X_L2_DEF_SCAN_BASE + i * 4)));
+        // Round-5 solve: FBPA_TRIM - the nonzero core 0x8211e8..0x8211fc is
+        // per-FBPA mem/PHY trim fuses (app08 consumer copy merges into
+        // NV_PFB_FBPA_n + 0x3d50), NOT the DEFective array - that stays
+        // hunted at OBJFUSE +0x248. Trim words are per-card data; compare
+        // same-die captures only.
+        println!("  FBPA_TRIM (0x8211c0..0x821240; per-FBPA mem/PHY trim fuses, ex-L2_DEF_SCAN; DEF hunt stays at OBJFUSE +0x248)");
+        for chunk in (0..AD10X_FBPA_TRIM_WORDS).step_by(8) {
+            print!("    {}", off_h(AD10X_FBPA_TRIM_BASE + chunk * 4));
+            for i in chunk..(chunk + 8).min(AD10X_FBPA_TRIM_WORDS) {
+                print!(" {}", cell_val(rd(AD10X_FBPA_TRIM_BASE + i * 4)));
             }
             println!();
         }
