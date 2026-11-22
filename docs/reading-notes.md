@@ -1076,6 +1076,135 @@ GA106 3060=28SM（8+10+10）、AD107 4060L=24SM（3 GPC×(6-2)×2）、AD102
    尾槽杂音，若当真则 126≠128）。判读 GPC 数组先定 die 的 GPC 域再逐槽。
 5. TU106 2070：四层全 badf，N/A（Turing fuse block 异址，FEAT 谱系）。
 
+### 6o. #237 六轮：AD103 公式非平凡成立 + SM_OVR 现役岛 + app08 零 store 收口（2026-11-21）
+
+JeusChrit 三连（VBIOS app01/07/08 全 55,522 条指令 byte-check + AD103 6-page
+对账 + OBJFUSE +0x248 拆解）：
+
+1. **公式矩阵更新：AD103（4080）非平凡成立**。GPC0 OPT(0x820760)=0x01→
+   STATUS=0x01；**GPC1 RECONF(0x82078c)=0x01→STATUS=0x01（OPT=0）**；
+   GPC2 全 0→0。GPC3 STATUS=0x30 而 OPT/RECONF=0 = 物理 4-TPC GPC 的高位
+   读 off——bit=disabled 语义在非满配 GPC 的自然读法（0.8.5 勘误互证）。
+   矩阵：AD102+AD103 非平凡、GA102 平凡、GA106/AD107 缺层、TU106 N/A。
+2. **bank A ≠ GPC0 disable（我方旧标签证伪）**：4090 GPC0=0x3f vs 4080
+   GPC0=0x01，而 bank A 两卡同读 `1,0,1,0`——0x8203a0 撞 0x01 纯巧合。
+   0.8.6 起 opt-dis 面标签改 **`[Ada bank A: die-constant, NOT GPC0
+   disable]`**。
+3. **OVR 角色修正**：`RECONF & ~OVR` 的 OVR = **0x820a40+4g（GA100_SM_OVR）**
+   per cmpunlocker PR#55/#58（GA100 写它撤 RECONF 切，+4 SM 软解锁先例），
+   非 CTRL 0x820838（那是 RPR 写禁用对，OR 进 STATUS）。AD102/AD103
+   6-page dump：**0x820a40..0x820abc 32 词现役解码岛（全 0）**夹在
+   badf5040 带中（0x820a00..a3c 与 0x820ac0..b1c 全 badf）。0.8.6
+   `GA100_SM_OVR_RGN` 面全区扫 0x820a00..0x820b1c（guard/island/tail 分
+   区）。**either/or 悬案**：0x82078c/0x820790 是可被 OVR 撤销的真 RECONF
+   熔丝，还是 Ada 把 OPT_TPC_DISABLE 拆在 0x820760+0x82078c 两处——只读
+   数据到此为止，分辨需门控写实验（开 PLM 后写 0x820a44/0x820a48 撤切）。
+   我方 0.8.5 验算用 OVR=CTRL=0，结论不变（两处 OVR 候选现读数全 0）。
+4. **Willian-Zhang 案镜像侧收口**：app01/07/08 + 595/610 两代 GSP 镜像
+   **零 store 到 0x00823804**（app08 写的是邻位 0x82380c/10/2c/3c）；且
+   FBPA_PLM 0x9a0148 冷态即 0xffffff0f（写 nibble=0）、v67 第四写被丢而
+   SEC2 照常 HALT（marker 0x67b00001）——与 FEAT 0xffffff0f 形态 1:1 同
+   构。PLM 门由熔丝态/早期 GFW/BROM 在 app08/GSP 之前设（kate-land
+   fuse-sense 窗图景一致）。专业模板 nibble=0 死锁从"载具侧推断"升级为
+   "镜像+真卡双向证据"。
+5. **OBJFUSE +0x248 拆解（0x557bd4）**：fbp 分派——一路 0x821224；fbp<2
+   走 0x8220c0/c4；fbp≥2 走 0x822100+4f。AD103 全读 0。0.8.6 新
+   `OBJFUSE_248` 面扫全七词，等 4090/3060 切 L2 卡分类（非零即 DEF 数组
+   候补——四轮在 DEF 窗没找到的那块）。
+6. **新参与者 rison1337**（桌面 4060, 10de:2882, 24MB L2）：IFF_RECORD
+   `0x033f02ff` = AD107 家族表 767..831/832 行预测命中（我方 4060L 同
+   die）。请求我方 4060L 行级 dump（0x2ff..0x33f 65 词）——**档案里
+   4060L 三份日志全部 0.8.3 以前**（无 IFF 面），且行级读取需 fuse
+   controller CMD_READ 序列（ff-tools read_rows 协议：IDLE+CRC_STATUS
+   0x55+FUSEDEBUG 0 前置、FUSEADDR 保存/恢复、双 pass 比对）=**新写类**
+   （宪法 §1.7 门控），ssdiag 未实现；已如实回复并索其两 pass 数据。
+
+**6o 追记（同日用户批准写类，0.8.7 340c8e3d）**：`--fuserows[=A-B]` 行级
+熔丝采集落地双胞胎——ff-tools read_rows 协议逐守卫移植（每行前 IDLE/
+CRC_STATUS 0x55/FUSEDEBUG 0 三验、FUSEADDR 锁存验证后才发 CMD_READ、
+FUSEDATA 拒 badf 留全 1=合法 OTP 词、双 pass 比对、原址恢复+验证永不静默），
+守卫失败=零写诊断中止，Turing（FUSE_ADDR=0xff 越域）自拒。写面仅两种：
+行号进 FUSEADDR、CMD_READ(0x1) 进 FUSECTRL——无编程命令路径。
+cargo 21/21（mock 控制器 5 测：happy/range/precondition 零写/latch 失败
+0×CMD_READ/解析器）。等 4060L 实采（命令：`ssdiag --fuserows=0x2ff-0x33f`，
+先全量 `--fuserows` 亦可）回 rison1337 行对比。
+
+**6o 追记二（2026-11-22，首采日）**：0.8.7 首跑暴露守卫的 GA100 专属假设
+——GA106 实测 CRC_STATUS=`0x4555` 被全字相等拒（**全部消费 die 归档值同
+为 0x4555**：GA102/AD103/AD107/AD102；GA100 才读裸 0x55，ff-tools 从未
+出过 A100）；FUSEDEBUG 同理（**GA10x=0，Ada 族=0x400000 常量**，2860
+locked==unlocked 同值）。守卫改：CRC 低字节==0x55、FUSEDEBUG∈{0,
+0x400000}、其余不变（用户裁定不 bump、原地以 0.8.7 重发，终版
+991c4690）。**负控按设计工作**：TU106 2070 跑 `--fuserows` 在 CRC_STATUS
+badf 处中止、零写（`FUSEROWS ABORT: CRC_STATUS 0xbadf5040 != 0x55`）。
+**GA106 3060 首采成功**（`docs/evidence/ga106-2504/fuserows-087-3060.log`
+——项目第一份消费级物理行捕获；粘贴缺 banner，守卫行为指纹锁定修正版）：
+- **行域表被数据边界直接确认**：IFF_RECORD `0x023f021e` → START=542/
+  LAST=575（576 行）；行数据零区 `0x137..0x21d` 恰在 **0x21e=542** 截止、
+  池区 542..575 31/34 非零（3 零行内插 0x21f/0x223/0x227）；FUSE_ADDR
+  保存/恢复=575==LAST；**池首行 bit5=1（IFF 型记录签名，与 kate-land
+  ff_boundary 判据一致）**。§6m 的 "GA10x 542..575" 从寄存器推断升级为
+  数据证实。
+- **配对结构（新发现）**：行 0x00..0x2d = **23/23 完全相同的奇偶对**
+  （冗余方案？），0x2e 起配对终止——与 GA100 512 行无此形态不同，待
+  4060L/4090 对照后判读是 GA106 专属还是 Ampere 通用。
+- **区域图（初判，解码开放）**：0x34..0x4e 随机型（ECC/签名/密钥类）；
+  0x4f..0x52 = `ffffffff` 空白 OTP；0x65..0xba/0xe3..0xec 结构化选项型
+  （`0x00010001`/`0x00030003`/`0x00077fff`/`0x000fffff`）；0xed..0x136
+  疑似 trim/VF 序列（与 CLK_TRIMS 10-bit 字段形态吻合）；0x137..0x21d
+  全零。
+- 协议全绿：双 pass 576 行全对、地址恢复验证通过。
+
+**6o 追记三（2026-11-22 下午，AD107 首采+池区 PLM 破题+Turing 读法）**：
+4060L 全量 832 行两 pass 全对（`docs/evidence/ad107-28e0/fuserows-087-4060l.log`，
+IFF `0x033f02ff` START=767 与 rison1337 桌面 4060 同值）：
+- **池区记录就是 PLM 模板的物理载体（重大）**：池行 0x300=**`0xffffff8f`**
+  （FEAT_OVR_PLM 出厂默认！）、0x304=`0xffffffbf`、0x331=`0xffffffdf`——
+  三个完整 PLM 掩码字烧在 FF 记录池里。FWSEC/devinit 的 PLM 编程模板第
+  一次被看见实物；**Willian-Zhang 专业卡 nibble=0 案的终极答案方向**：专业
+  SKU 的差异就烧在这个池的对应记录里（其池区 65 行 = 直接比对目标）。
+- **跨族通用行**：行 0x1e/0x1f（`0x0be3071f`）与 0x20/0x21（`0xffe04f97`）
+  在 GA106 与 AD107 **同行号同值**——通用 OTP 字段；池尾记录序列
+  （0x33d/e/f ↔ GA106 0x234/5/6 的 `0x008c2c3c`/`0xff7fdffb`/`0x00802004`）
+  逐词同值而行号不同——共享记录内容、池起点逐 die。
+- **配对长度逐 die**：AD107 0x00..0x69（53 对）vs GA106 0x00..0x2d
+  （23 对）——奇偶全同配对是通用形态，长度按 die 配置。
+- 区域图：签名/ECC 型 0x6a..0xbb 与 0x8e..0xa7/0xac/0xb7..0xbb；选项型
+  0xbe..0x105（0x00010001/0x007f0001/0x07ff3fff/0x7fff7fff——与 GA106
+  同类）；trim/VF 型 0x144..0x1c2（比 GA106 的 0xed..0x136 长一倍）；
+  长零区 0x1c3..0x2fe；池 0x2ff..0x33f 56/65 非零、首行 bit5=1。
+- **Turing 读法落地（0.8.8，9fb4969d）**：envytools pfuse 证实 PFUSE 阵列
+  0x021000（G80+ 恒定），2070 实测 0x21000 块 CTRL idle 语义同构
+  （0xc0040000）、FUSEDEBUG=0、**块 PLM 0x210f8=OPEN**、CRC_STATUS badf
+  （GA100 布局 0x820000 上 CRC/IFF 双 badf——2070 负控走此路）。
+  `--fusebase`（族自动 turing→0x21000）+ 降级守卫（CRC 不可读→明示关闭；
+  IFF 不可读→显式区间强制、512 帽）；cargo 25/25（新增 Turing 降级两测）、
+  unittest 12/12。同写类（行号+CMD_READ）。
+
+**6o 追记四（2026-11-22 下午，TU106 首采——三族行域全闭合）**：2070
+`--fuserows=0x0-0xff`（0.8.8，turing 自动基址 0x21000）成功：
+`docs/evidence/tu106-1f07/fuserows-088-2070.log`。**256 行域从 §6m 假设
+升格为数据事实**（双 pass 全对、FUSE_ADDR 保存/恢复=255==LAST）。
+**关键修正：Turing 移位基址的 IFF 可读**——0x21050 读纯词
+`0x00ff00b1` → START=177/LAST=255（被挡的只是 GA100 布局 0x820050）；
+实际降级只有 CRC 一项（明示后继续，锁存+双 pass+恢复全绿）。
+池区（177..255，79/79 非零，首行 bit5=1）与 GA10x/Ada 同构：
+- **PLM 模板 record 三代同值**：TU106 行 0xe2/0xe4 = **`0xffffff8f`**
+  （两份，带头 0x0118fefd/0x0118fffd）↔ AD107 0x300 同值——FEAT PLM
+  出厂默认烧在三代池区的同一 record 家族里；0x0122/0x0118 头部族
+  38 行=与 GA10x/Ada 相同的 record 格式。
+- **共享 record 内容逐词命中**：TU 0xfd/fe/ff = GA106 池 0x237/8/9
+  （`0x000020fc`/`0xdffffff3`/`0x2000000c`）；record 终结符
+  `0x00000008` ×6 ↔ GA106 0x18/9 ↔ AD107 0x302/0x32d；TU 0x32=
+  `0x00010301` ↔ AD107 0x6c——**0x10301 的来源（§6n 尾槽神秘值）首次
+  现身于真实 fuse 行**。
+- 配对 0x00..0x27（20 对）；签名/ECC 区 0x2a..0x57（含全 1 OTP
+  0x48..0x4a）；trim/VF 型 0x60..0x7f；零区 0x80..0xb0 恰在池首截断。
+- **行域总表收口（数据级）**：TU106 177..255/256、GA10x 542..575/576、
+  Ada 767..831/832——START 与 LAST 全部被行数据边界独立证实（零区
+  截断+池首 bit5），寄存器解码与物理数据零冲突。
+- **fuserow 三份全留档 evidence**（3060/4060L/2070，溯源头+守卫指纹）。
+
 ### 7. 判读指南（TU106/GA106 实验用）
 
 - `badf5040 [PRIV_VIOLATION]` → 词在**已证实解码的块内**时=存在、PLM 挡读

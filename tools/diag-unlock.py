@@ -234,8 +234,25 @@ OPT_FUSE_ROWS = [
 ]
 # cmpunlocker PR#55's GA100 per-GPC SM override/status banks. On 20-40
 # series expect badf - the existence/nonexistence answer per die, read-only.
-GA100_SM_OVR_BASE = 0x0082_0A40
+# Round 6 (JeusChrit 11-21): OVR role in `RECONF & ~OVR` = 0x820a40+4g
+# (cmpunlocker PR#55/#58), NOT the CTRL 0x820838 pair; AD102/AD103 6-page
+# dumps show a live decoded island 0x820a40..0x820abc (32 words, zero)
+# between badf5040 strips - sweep the full region so boundaries map per die.
+GA100_SM_OVR_BASE = 0x0082_0A00
+GA100_SM_OVR_ISLAND = 0x0082_0A40
+GA100_SM_OVR_REGION_WORDS = 72  # 0x820a00..0x820b1c inclusive
 GA100_SM_STATUS_BASE = 0x0082_0C38
+# #237 round 6: OBJFUSE +0x248 companion words (0x557bd4, dispatched on
+# fbp) - all 0 on the AD103 capture; swept so cut-L2 captures classify them.
+OBJFUSE_248_ROWS = (
+    ("OBJ248_821224", 0x0082_1224),
+    ("OBJ248_FBP0", 0x0082_20C0),
+    ("OBJ248_FBP1", 0x0082_20C4),
+    ("OBJ248_FBP2", 0x0082_2100),
+    ("OBJ248_FBP3", 0x0082_2104),
+    ("OBJ248_FBP4", 0x0082_2108),
+    ("OBJ248_FBP5", 0x0082_210C),
+)
 GA100_GPCS = 8
 
 # ---------------------------------------------------------------------------
@@ -987,10 +1004,17 @@ def report(bar, tag="", devpath=None):
         dump_tpc(bar)
         rrow(bar, OPT_FUSE_ROWS)
         print("  --- GA100-style per-GPC SM banks (badf elsewhere = absent) ---")
-        ovr = "  ".join(f"{bar.rd(GA100_SM_OVR_BASE + 4 * g):#010x}" for g in range(GA100_GPCS))
+        # Round 6: full OVR region sweep (guard/island/tail). The island IS
+        # the OVR layer of `STATUS = OPT | (RECONF & ~OVR)` (cmpunlocker
+        # #55/#58 wrote 0x820a40+4g to cancel RECONF cuts on GA100, +4 SM).
+        print(f"  GA100_SM_OVR_RGN {GA100_SM_OVR_BASE:#010x}..{GA100_SM_OVR_BASE + 4 * (GA100_SM_OVR_REGION_WORDS - 1):#010x} (island 0x820a40+4g = RECONF-cancel OVR per cmpunlocker#55/#58)")
+        for chunk in range(0, GA100_SM_OVR_REGION_WORDS, 8):
+            start = GA100_SM_OVR_BASE + 4 * chunk
+            zone = "guard" if start < GA100_SM_OVR_ISLAND else ("island" if start < GA100_SM_OVR_ISLAND + 32 * 4 else "tail")
+            cells = " ".join(f"{bar.rd(GA100_SM_OVR_BASE + 4 * i):#010x}"
+                             for i in range(chunk, min(chunk + 8, GA100_SM_OVR_REGION_WORDS)))
+            print(f"    [{zone}] {start:#010x} {cells}")
         stat = "  ".join(f"{bar.rd(GA100_SM_STATUS_BASE + 4 * g):#010x}" for g in range(GA100_GPCS))
-        sm_note = " (GA100 bank; on Ada CTRL_OPT_TPC_GPC = 0x00820838+4g, see TPC section)" if fam == "ada" else ""
-        print(f"  GA100_SM_OVR{sm_note}  {ovr}")
         print(f"  GA100_SM_STAT {stat}")
         print("  --- PCIe link block (XVE shadows; consumer dies read stock/benign) ---")
         rrow(bar, PCIE_LINK_ROWS)
@@ -1012,13 +1036,14 @@ def report(bar, tag="", devpath=None):
             note = f" ({decode_plm(v)})" if name.endswith("PLM") else ""
             b = badf_bucket(v)
             tag = f" [{b}]" if b else ""
-            # #237 round 4 stale-GA100-label fixes: on Ada 0x8203a0..0x8203bc
-            # is the TPC-disable fuse bank A (not SYS_PIPE), and the GPC7
-            # defective/CP pair is a GA100-only layout (badf on Ada).
+            # Round 4 label, corrected round 6: bank A is NOT the GPC0
+            # disable mask - 4090/4080 read identical 1,0,1,0 despite
+            # different GPC0 masks (0x3f vs 0x01), a proven coincidence -
+            # it is die-constant data of unknown role.
             ada_note = ""
             if fam == "ada":
                 if 0x0082_03A0 <= off <= 0x0082_03B8:
-                    ada_note = " [Ada: TPC disable bank A]"
+                    ada_note = " [Ada bank A: die-constant, NOT GPC0 disable]"
                 elif name in ("TPC_GPC7_DEFECTIVE", "TPC_GPC7_DISABLE_CP"):
                     ada_note = " [GA100-only]"
             print(f"  {label:<10} {name:<26} = {v:#010x}{note}{tag}{ada_note}")
@@ -1146,6 +1171,15 @@ def report(bar, tag="", devpath=None):
         else:
             pred_s, marks = "n/a", ""
         print(f"    FBP[{f}] {AD10X_L2_CAND_FBP + 4 * f:#010x} cand={c:#010x} sw={s:#010x} eff={e:#010x} pred={pred_s}{marks}")
+    # #237 round 6: OBJFUSE +0x248 companion words (0x557bd4 dispatch on
+    # fbp) - nonzero on the 4090/3060 would make them the DEF-array
+    # candidate that round 4 failed to find at the DEF window.
+    print("  OBJFUSE_248 (0x557bd4 paths: 0x821224; fbp<2 0x8220c0/c4; fbp>=2 0x822100+4f)")
+    for name, off in OBJFUSE_248_ROWS:
+        v = bar.rd(off)
+        b = badf_bucket(v)
+        tag = f" [{b}]" if b else ""
+        print(f"    {name:<14} {off:#010x} = {v:#010x}{tag}")
     # Round-5 solve: FBPA_TRIM - the nonzero core 0x8211e8..0x8211fc is
     # per-FBPA mem/PHY trim fuses (app08 consumer copy merges into
     # NV_PFB_FBPA_n + 0x3d50), NOT the DEFective array - that stays hunted
@@ -1277,16 +1311,210 @@ def report(bar, tag="", devpath=None):
     return fam, regs, plm, unlocked
 
 
+# --- #237 round 6: --fuserows, WRITE MODE (user-approved) ---
+# The same fuse-controller IP block lives at two bases: GA10x/Ada at
+# 0x820000, Turing at 0x21000 (envytools pfuse; both read plausible idle
+# CTRL on the 2070). Offsets inside the block are identical.
+FUSE_BASE_GA100_LAYOUT, FUSE_BASE_TURING = 0x0082_0000, 0x0002_1000
+FUSE_CMD_READ, FUSE_CMD_MASK, FUSE_SPIN_LIMIT = 0x1, 0x3, 1 << 20
+FUSE_MAX_ROWS = 512
+
+
+def fuse_ctrl(base):
+    return base
+
+
+def fuse_addr(base):
+    return base + 0x4
+
+
+def fuse_data(base):
+    return base + 0x8
+
+
+def fuse_iff(base):
+    return base + 0x50
+
+
+def fuse_debug(base):
+    return base + 0x60
+
+
+def fuse_crc(base):
+    return base + 0x70
+
+
+def _fuse_guard_ok(bar, base, crc_readable=True):
+    """One ff-tools guard round; returns an error string or None.
+
+    crc_readable=False (Turing: CRC_STATUS badf at PL0) skips the CRC
+    check - decided once before any write, announced in the header.
+    """
+    ctrl = bar.rd(fuse_ctrl(base))
+    if ctrl & 0xFFFF0000 == 0xBADF0000:
+        return f"FUSECTRL reads {ctrl:#010x} (PRI error) - controller not accessible"
+    if ctrl == 0xFFFF_FFFF:
+        return "FUSECTRL reads all-ones - not decoded/accessible here"
+    if (ctrl >> 16) & 31 != 4 or ctrl & FUSE_CMD_MASK != 0:
+        return f"FUSECTRL {ctrl:#010x} not idle (state={(ctrl >> 16) & 31} cmd={ctrl & FUSE_CMD_MASK})"
+    crc = bar.rd(fuse_crc(base))
+    # GA100 reads bare 0x55 (ff-tools full-word check); EVERY consumer die
+    # observed reads 0x4555 (GA106 live 2026-11-22 user run + GA102/AD103/
+    # AD107/AD102 archived) - the low byte is the ready signature, upper
+    # bits carry die-dependent status. Strict equality was GA100-tuned and
+    # aborted GA10x/Ada before any row.
+    if crc_readable and crc & 0xFF != 0x55:
+        return f"CRC_STATUS {crc:#010x} - low byte != 0x55"
+    dbg = bar.rd(fuse_debug(base))
+    if dbg & 0xFFFF0000 == 0xBADF0000 or dbg == 0xFFFF_FFFF:
+        return f"FUSEDEBUG {dbg:#010x} unreadable - debug state unknown"
+    # Two observed-normal values: 0 on GA100/GA10x, 0x400000 on Ada
+    # (4060L/4090/2860, identical locked and unlocked). Anything else is an
+    # unknown debug state - row data could be falsified; abort rather than
+    # guess bit semantics we do not have.
+    if dbg != 0 and dbg != 0x0040_0000:
+        return f"FUSEDEBUG {dbg:#010x} not a known-normal value (0 GA100/GA10x, 0x400000 Ada) - possible debug mode, row data could be falsified"
+    return None
+
+
+def _fuse_wait_idle(bar, base):
+    for _ in range(FUSE_SPIN_LIMIT):
+        ctrl = bar.rd(fuse_ctrl(base))
+        if (ctrl >> 16) & 31 == 4 and ctrl & FUSE_CMD_MASK == 0:
+            return None
+    return "controller never returned to idle within the spin limit"
+
+
+def fuse_row_dump(bar, rng, base=FUSE_BASE_GA100_LAYOUT):
+    """Physical fuse-row capture, ported from ga100-ff-tools read_rows.
+
+    Writes are ONLY row numbers to FUSEADDR (latch-verified) and CMD_READ
+    to FUSECTRL - no programming command on this path; the original
+    FUSEADDR is restored+verified on every exit path. Returns complete.
+    """
+    print("--- FUSE ROW DUMP (WRITE MODE) - writes: FUSEADDR row numbers + FUSECTRL CMD_READ only; no programming command; address restored after ---")
+    print("  protocol: ga100-ff-tools read_rows (two passes, latch checks); a bound kernel driver is a concurrency risk - pass mismatches mark rows unreliable")
+    fail = None
+    crc_word = bar.rd(fuse_crc(base))
+    crc_readable = not (crc_word & 0xFFFF0000 == 0xBADF0000 or crc_word == 0xFFFF_FFFF)
+    err = _fuse_guard_ok(bar, base, crc_readable)
+    if err:
+        print(f"  FUSEROWS ABORT: {err} - no writes performed")
+        return False
+    if not crc_readable:
+        print(f"  FUSEROWS DEGRADED: CRC_STATUS {crc_word:#010x} unreadable at this base (Turing: undecoded/PLM-blocked at PL0) - proceeding WITHOUT the CRC guard; latch verification, two passes and address restore remain active")
+    saved = bar.rd(fuse_addr(base))
+    if saved & 0xFFFF0000 == 0xBADF0000 or saved == 0xFFFF_FFFF:
+        print(f"  FUSEROWS ABORT: FUSEADDR {saved:#010x} unreadable - no writes performed")
+        return False
+    if saved >= FUSE_MAX_ROWS:
+        print(f"  FUSEROWS ABORT: FUSEADDR {saved} outside the {FUSE_MAX_ROWS}-row address field - no writes performed")
+        return False
+    iff = bar.rd(fuse_iff(base))
+    iff_readable = not (iff & 0xFFFF0000 == 0xBADF0000 or iff == 0xFFFF_FFFF)
+    if iff_readable:
+        _, last = iff_decode(iff)
+        if saved > last:
+            print(f"  FUSEROWS ABORT: FUSEADDR {saved} outside the IFF domain 0..{last} - no writes performed")
+            return False
+        if rng == "all":
+            first, last_row = 0, last
+        else:
+            ra, rb = rng
+            if rb > last:
+                print(f"  FUSEROWS ABORT: range {ra:#x}-{rb:#x} exceeds the IFF domain 0..{last}")
+                return False
+            first, last_row = ra, rb
+    else:
+        # No IFF on this die: domain unverified; explicit range mandatory.
+        if rng == "all" or rng is None:
+            print(f"  FUSEROWS ABORT: IFF_RECORD {iff:#010x} unreadable and no explicit range given - pass --fuserows=A-B (capped at {FUSE_MAX_ROWS} rows); no writes performed")
+            return False
+        ra, rb = rng
+        if rb >= FUSE_MAX_ROWS:
+            print(f"  FUSEROWS ABORT: range {ra:#x}-{rb:#x} exceeds the {FUSE_MAX_ROWS}-row address cap")
+            return False
+        print(f"  FUSEROWS DEGRADED: IFF_RECORD {iff:#010x} unreadable - row domain UNVERIFIED, dumping the requested {ra:#x}..{rb:#x}; out-of-domain rows read junk, not harm")
+        first, last_row = ra, rb
+    print(f"  domain: rows {first}..{last_row} (IFF_RECORD {iff:#010x}, saved FUSEADDR {saved}) - two passes")
+    passes = [[], []]
+    for p in range(2):
+        buf = passes[p]
+        for row in range(first, last_row + 1):
+            err = _fuse_guard_ok(bar, base, crc_readable)
+            if err:
+                fail = f"pass {p + 1} row {row}: {err}"
+                break
+            bar.wr(fuse_addr(base), row)
+            if bar.rd(fuse_addr(base)) != row:
+                fail = f"pass {p + 1} row {row}: FUSEADDR did not latch"
+                break
+            bar.wr(fuse_ctrl(base), FUSE_CMD_READ)
+            err = _fuse_wait_idle(bar, base)
+            if err:
+                fail = f"pass {p + 1} row {row}: {err}"
+                break
+            v = bar.rd(fuse_data(base))
+            if v & 0xFFFF0000 == 0xBADF0000:
+                fail = f"pass {p + 1} row {row}: FUSEDATA {v:#010x} (PRI error)"
+                break
+            buf.append(v)  # all-ones is a legal OTP word, kept verbatim
+        if fail:
+            break
+    bar.wr(fuse_addr(base), saved)
+    restored = bar.rd(fuse_addr(base)) == saved
+    if not restored:
+        print(f"  FUSEROWS RESTORE FAILED: original FUSEADDR {saved} DID NOT RESTORE (reads {bar.rd(fuse_addr(base)):#010x}) - investigate before trusting anything else")
+    complete = fail is None and restored
+    if fail:
+        print(f"  FUSEROWS ABORT: {fail} - gathered prefix below, INCOMPLETE")
+    elif complete:
+        print("  FUSEROWS OK: both passes complete, address restored")
+    mismatches = [i for i in range(len(passes[0])) if passes[0][i] != passes[1][i]] if complete else []
+    if complete and not mismatches:
+        print(f"  two passes match ({len(passes[0])} rows)")
+    elif complete:
+        print(f"  PASS MISMATCH: {len(mismatches)} row(s) differ between passes - treat as unreliable")
+        for i in mismatches[:16]:
+            print(f"    row {first + i:#x}: pass1 {passes[0][i]:#010x} pass2 {passes[1][i]:#010x}")
+    for i, v in enumerate(passes[0]):
+        print(f"FUSEROW {first + i:#x} = {v:#010x}")
+    return complete
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bdf", help="only this PCI address, e.g. 0000:01:00.0")
     ap.add_argument("--reapply", action="store_true",
                     help="write SS0=0x88888888 SS1=0x8 where the PLM gate is open")
+    ap.add_argument("--fusebase", default=None, metavar="HEX",
+                    help="fuse-controller block base override (default family-auto: "
+                         "Turing 0x21000, GA10x+/Ada 0x820000; same layout)")
+    ap.add_argument("--fuserows", nargs="?", const="all", default=None, metavar="A-B",
+                    help="WRITE MODE: physical fuse-row capture (ga100-ff-tools read_rows"
+                         " protocol: FUSEADDR row select + FUSECTRL CMD_READ only, guarded,"
+                         " two passes, address restored). Range A-B hex/decimal;"
+                         " default = whole IFF domain")
     ap.add_argument("--inventory", action="store_true",
                     help="print the unelevated read-only hardware inventory "
                          "block (OS/CPU/board/BIOS/chassis/per-GPU family "
                          "verdict + advisories) and exit - no root needed")
     args = ap.parse_args()
+
+    fuserows = None
+    if args.fuserows is not None:
+        if args.fuserows == "all":
+            fuserows = "all"
+        else:
+            try:
+                ra, rb = args.fuserows.split("-", 1)
+                pa = int(ra, 16) if ra.strip().lower().startswith("0x") else int(ra)
+                pb = int(rb, 16) if rb.strip().lower().startswith("0x") else int(rb)
+                assert 0 <= pa <= pb
+                fuserows = (pa, pb)
+            except (ValueError, AssertionError):
+                print("bad range; use A-B, hex or decimal (e.g. --fuserows=0x2ff-0x33f)", file=sys.stderr)
+                return 2
 
     if args.inventory:
         return inventory()
@@ -1336,6 +1564,14 @@ def main():
                 print(f"  reapply: SS0={rb0:#010x} SS1={rb1:#010x} -> {'OK' if ok else 'READBACK MISMATCH'}"
                       " (read-back is the only success criterion)")
                 rc = 0 if ok else 1
+        if fuserows is not None:
+            base = None
+            if args.fusebase:
+                base = int(args.fusebase, 16) if args.fusebase.lower().startswith("0x") else int(args.fusebase, 16)
+            if base is None:
+                base = FUSE_BASE_TURING if fam == "turing" else FUSE_BASE_GA100_LAYOUT
+            if not fuse_row_dump(bar, fuserows, base):
+                rc = 1
     return rc
 
 

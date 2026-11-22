@@ -156,7 +156,16 @@ pub struct PciIoRaw {
         unsafe extern "efiapi" fn(*mut PciIoRaw, *mut usize, *mut usize, *mut usize, *mut usize) -> Status,
     /// EfiPciIoAttributeOperation(Get/Enable/...), arg, arg, status out
     attributes: unsafe extern "efiapi" fn(*mut PciIoRaw, u32, u64, u64, *mut Status) -> Status,
-    _get_bar_attributes: *const c_void,
+    /// EDK2 PciIo.h EFI_PCI_IO_PROTOCOL_GET_BAR_ATTRIBUTES: (This,
+    /// BarIndex 0..=5, OUT u64 *Supports OPTIONAL, OUT VOID **Resources
+    /// OPTIONAL). Resources = an AllocateZeroPool'd buffer holding one
+    /// packed EFI_ACPI_ADDRESS_SPACE_DESCRIPTOR (46 B) followed by an
+    /// EFI_ACPI_END_TAG_DESCRIPTOR (2 B); the caller frees it with
+    /// FreePool. AddrRangeMin (offset 14) carries the firmware-assigned
+    /// base address (translation-adjusted per UEFI 2.7 semantics), AddrLen
+    /// (offset 38) the BAR length.
+    get_bar_attributes:
+        unsafe extern "efiapi" fn(*mut PciIoRaw, u8, *mut u64, *mut *mut c_void) -> Status,
     _set_bar_attributes: *const c_void,
     rom_size: u64,
     rom_image: *const c_void,
@@ -166,6 +175,7 @@ pub struct PciIoRaw {
 const _: () = assert!(core::mem::offset_of!(PciIoRaw, pci) == 6 * 8); // slots: PollMem,PollIo,Mem{r,w},Io{r,w} -> Pci.Read
 const _: () = assert!(core::mem::offset_of!(PciIoRaw, get_location) == 14 * 8);
 const _: () = assert!(core::mem::offset_of!(PciIoRaw, attributes) == 15 * 8);
+const _: () = assert!(core::mem::offset_of!(PciIoRaw, get_bar_attributes) == 16 * 8);
 const _: () = assert!(core::mem::offset_of!(PciIoRaw, rom_size) == 18 * 8);
 const _: () = assert!(core::mem::size_of::<PciIoRaw>() == 20 * 8);
 
@@ -440,6 +450,56 @@ impl PciIo {
         self.pmcsr(cap) & 0x3 == 0
     }
 
+    /// GetBarAttributes (slot 16) for one BAR index (0..=5): returns
+    /// (res_type, base, len, granularity) parsed from the protocol's
+    /// EFI_ACPI_ADDRESS_SPACE_DESCRIPTOR. The base is the firmware-assigned
+    /// host address (translation-adjusted), i.e. exactly the value to write
+    /// back into the device's BAR after a reset. The protocol allocates the
+    /// buffer (AllocateZeroPool: descriptor 46 B + end tag 2 B) - freed here
+    /// with FreePool before returning. `None` = the call failed, the BAR is
+    /// unassigned, or the buffer did not parse.
+    ///
+    /// The bookkeeping lives host-side (built at POST enumeration), so this
+    /// works even when the DEVICE's config space has since gone dead - the
+    /// only BAR-assignment source for a slot that reads 0xffff.
+    #[cfg(feature = "tx")]
+    pub fn get_bar_attributes(&self, bar_index: u8) -> Option<(u8, u64, u64, u64)> {
+        type Fn = unsafe extern "efiapi" fn(
+            *mut PciIoRaw,
+            u8,
+            *mut u64,
+            *mut *mut c_void,
+        ) -> Status;
+        let f: Fn = unsafe { core::mem::transmute(self.0.get_bar_attributes) };
+        let mut resources: *mut c_void = core::ptr::null_mut();
+        let st = unsafe {
+            f(
+                &self.0 as *const _ as *mut _,
+                bar_index,
+                core::ptr::null_mut(), // Supports: not needed
+                &mut resources,
+            )
+        };
+        if st != Status::SUCCESS || resources.is_null() {
+            info!(
+                "BAR-BOOKKEEPING: GetBarAttributes({bar_index}) -> {st:?}{}",
+                if resources.is_null() { " (null buffer)" } else { "" }
+            );
+            return None;
+        }
+        // Safety: the protocol handed us an AllocateZeroPool'd buffer of
+        // descriptor + end tag (>= 48 bytes); we read only the first 46.
+        let parsed = {
+            let buf =
+                unsafe { core::slice::from_raw_parts(resources.cast::<u8>(), 46) };
+            parse_bar_descriptor(buf)
+        };
+        if let Some(p) = core::ptr::NonNull::new(resources.cast::<u8>()) {
+            let _ = unsafe { boot::free_pool(p) };
+        }
+        parsed
+    }
+
     /// Coherent common-buffer DMA allocation (AllocateBuffer + Map).
     /// TOTORONG craft uses EfiReservedMemoryType, but consumer firmware
     /// (observed on AD107M) rejects it with INVALID_PARAMETER — fall back
@@ -664,6 +724,162 @@ impl DmaBuffer {
     }
 }
 
+/// Root-port/bridge register snapshot for the "#276 dead slot" families: a
+/// downstream slot whose functions read vendor 0xffff while the card itself
+/// is demonstrably alive (its GOP drives the console - scanout is autonomous
+/// once the display pipeline is programmed). The discriminators (D-state,
+/// Link Disable, Link Active, and the CURRENT secondary bus number vs. the
+/// one the dead function's handle was created under) all live on the PORT,
+/// not on the dead function.
+#[cfg(feature = "tx")]
+pub struct PortDiagRaw {
+    /// 0x18: primary/secondary/subordinate bus numbers, as programmed NOW.
+    pub buses: u32,
+    pub pmcsr: Option<u16>,
+    pub lnkcap: Option<u16>,
+    pub lnkctl: Option<u16>,
+    pub lnksta: Option<u16>,
+    pub bcr: Option<u16>,
+}
+
+/// Read-only snapshot off a bridge/root-port's own PciIo handle. Every
+/// lookup walks the capability list instead of assuming standard offsets.
+#[cfg(feature = "tx")]
+pub fn read_port_diag(pci: &PciIo) -> PortDiagRaw {
+    let buses = pci.config_read_u32(0x18);
+    let pmcsr = pci.pm_cap().map(|c| pci.pmcsr(c));
+    let (lnkcap, lnkctl, lnksta) = match pci.pcie_cap() {
+        Some(c) => (
+            Some(pci.config_read_u16(c as u32 + 0x0c)),
+            Some(pci.config_read_u16(c as u32 + 0x10)),
+            Some(pci.config_read_u16(c as u32 + 0x12)),
+        ),
+        None => (None, None, None),
+    };
+    let bcr = Some(pci.config_read_u16(0x3e));
+    PortDiagRaw { buses, pmcsr, lnkcap, lnkctl, lnksta, bcr }
+}
+
+/// Ladder choice for a bridge whose downstream function(s) read vendor
+/// 0xffff. Pure function: sim/src/port_diag.rs mirrors this body verbatim
+/// and unit-tests the ordering (the loader is UEFI-target-only and cannot
+/// run host tests).
+#[cfg(feature = "tx")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviveLever {
+    /// Link up, D0, and the dead fn's recorded bus matches the port's current
+    /// secondary bus - a genuinely paradoxical capture; log the anomaly, take
+    /// no lever.
+    NoneHealthy,
+    /// Link up AND the port's secondary bus no longer matches the bus the
+    /// dead function's handle was created under - the device was RELOCATED by
+    /// firmware renumbering, not powered down. Memory TLPs route by window and
+    /// still land (the console keeps updating); config TLPs route by bus
+    /// number and master-abort (exactly "console alive, config 0xffff"). No
+    /// revival applies - a living device is never "revived"; relocation-aware
+    /// discovery is the follow-up.
+    NoneRelocated,
+    /// PMCSR power state != D0 - park the port back at D0 first. A parked
+    /// port stops its LTSSM, so the other levers are meaningless under it.
+    PmcsrD0,
+    /// Link Control "Link Disable" (bit 4) set - clear it; the LTSSM
+    /// retrains. A secondary bus reset also clears this bit.
+    ClearLinkDisable,
+    /// Software-visible state is clean but the link is not active - force it:
+    /// Secondary Bus Reset (Bridge Control bit 6) drives a hot reset that
+    /// clears Link Disable and kicks the LTSSM out of a stuck L2/L3-Ready
+    /// (a PME_Turn_Off handshake whose power-removal step never came - the
+    /// #276 board has no ACPI rail resource to finish it).
+    SecondaryBusReset,
+}
+
+/// Raw capture plus the decoded fields and the chosen lever.
+#[cfg(feature = "tx")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PortState {
+    pub d_state: u8,
+    pub link_disable: bool,
+    pub link_active: bool,
+    pub speed: u8,
+    pub width: u8,
+    pub sec_bus: u8,
+    pub relocated: bool,
+    pub lever: ReviveLever,
+}
+
+/// Ladder ordering: D-state first (a parked port stops its LTSSM, so the
+/// other levers are meaningless under it), then Link Disable (software-
+/// commanded down), then the SBR hammer. "Link up" with a stale recorded bus
+/// is relocation, not death - never "revive" a living device. `None` in the
+/// capability slots means the walk found nothing; treated as healthy defaults
+/// (D0 / not disabled / link assumed ACTIVE) so a port whose state cannot be
+/// read never triggers a lever on its own.
+///
+/// sim/src/port_diag.rs mirrors this body verbatim - keep them identical.
+#[cfg(feature = "tx")]
+pub fn decode_port_state(
+    pmcsr: Option<u16>,
+    lnkctl: Option<u16>,
+    lnksta: Option<u16>,
+    sec_bus: u8,
+    dead_recorded_bus: Option<u8>,
+) -> PortState {
+    let d_state = (pmcsr.unwrap_or(0) & 0x3) as u8;
+    let link_disable = lnkctl.map(|v| v & 0x10 != 0).unwrap_or(false);
+    // DLLLA (Data Link Layer Link Active) is LnkSta bit 14 (0x4000) - the
+    // field round on 2026-11-22 (TU106 bench, loader.log of the SLOT-REVIVE
+    // build) caught the first draft reading bit 13 (0x2000, Link Bandwidth
+    // Management Status): the TU106's own PEG port 00:01.0 - link verifiably
+    // up, the transaction ran green on it - decoded LA=0 there while bit 14
+    // read 1 (lnksta=0xD101).
+    let link_active = lnksta.map(|v| v & 0x4000 != 0).unwrap_or(true);
+    let speed = (lnksta.unwrap_or(0) & 0xf) as u8;
+    let width = ((lnksta.unwrap_or(0) >> 4) & 0x3f) as u8;
+    let relocated = link_active && dead_recorded_bus.map(|b| b != sec_bus).unwrap_or(false);
+    let lever = if d_state != 0 {
+        ReviveLever::PmcsrD0
+    } else if link_disable {
+        ReviveLever::ClearLinkDisable
+    } else if !link_active {
+        ReviveLever::SecondaryBusReset
+    } else if relocated {
+        ReviveLever::NoneRelocated
+    } else {
+        ReviveLever::NoneHealthy
+    };
+    PortState { d_state, link_disable, link_active, speed, width, sec_bus, relocated, lever }
+}
+
+/// Parse one ACPI address-space descriptor from a GetBarAttributes Resources
+/// buffer. Packed EFI_ACPI_ADDRESS_SPACE_DESCRIPTOR (EDK2 Acpi10.h, 46 B):
+/// `Desc`@0 (large-item tag 0x8A QWord / 0x87 DWORD), `Len`@1 u16 (body
+/// length = sizeof-3), `ResType`@3 (0 = memory, 1 = I/O),
+/// `AddrSpaceGranularity`@6 u64, `AddrRangeMin`@14 u64 (the firmware-
+/// assigned base, translation-adjusted), `AddrRangeMax`@22 u64 (the BAR's
+/// alignment), `AddrTranslationOffset`@30 u64, `AddrLen`@38 u64 (the BAR
+/// length). Returns (res_type, base, len, granularity).
+///
+/// sim/src/port_diag.rs mirrors this body verbatim - keep them identical.
+#[cfg(feature = "tx")]
+pub fn parse_bar_descriptor(buf: &[u8]) -> Option<(u8, u64, u64, u64)> {
+    if buf.len() < 46 {
+        return None;
+    }
+    let tag = buf[0];
+    if tag != 0x8A && tag != 0x87 {
+        return None;
+    }
+    let res_type = buf[3];
+    let rd = |o: usize| -> Option<u64> {
+        let s = buf.get(o..o + 8)?;
+        Some(u64::from_le_bytes(s.try_into().ok()?))
+    };
+    let gran = rd(6)?;
+    let min = rd(14)?;
+    let len = rd(38)?;
+    Some((res_type, min, len, gran))
+}
+
 /// One NVIDIA display adapter found by [`enumerate`] (function 0 only).
 #[derive(Clone, Copy)]
 pub struct FoundGpu {
@@ -729,6 +945,18 @@ pub fn enumerate() -> alloc::vec::Vec<FoundGpu> {
         let vendor = pci.config_read_u16(0x00);
         let device = pci.config_read_u16(0x02);
         if vendor == 0xffff || vendor == 0x0000 {
+            // Dead functions are the raw material of the #276 discrimination
+            // (a slot that reads 0xffff while the card itself is alive) - and
+            // they are exactly what the ultrafast profile would hide, since
+            // the stock empty-slot line is gated. The bench round of
+            // 2026-11-22 proved the blind spot is real: the ASMedia bridge
+            // 04:00.0 vanished from one boot's enumeration with no trace in
+            // the log. One unconditional line per dead function, so even an
+            // ultrafast round leaves the intermittent shape on the stick.
+            #[cfg(feature = "tx")]
+            info!(
+                "PORT-DIAG: {seg:04x}:{bus:02x}:{dev:02x}.{fun} DEAD (vendor {vendor:#06x}) - judged by SLOT-REVIVE only when \\tx-revive-dead-slot.txt is armed"
+            );
             if !crate::ultrafast() {
                 info!("PCI {:04x}:{:02x}:{:02x}.{} empty slot (vendor {:#06x})", seg, bus, dev, fun, vendor);
             }
@@ -739,6 +967,30 @@ pub fn enumerate() -> alloc::vec::Vec<FoundGpu> {
             info!(
                 "PCI {:04x}:{:02x}:{:02x}.{} {:04x}:{:04x} class {:06x}",
                 seg, bus, dev, fun, vendor, device, class
+            );
+        }
+
+        // PORT-DIAG: unconditional register snapshot of every PCI-to-PCI
+        // bridge/root port - deliberately NOT ultrafast-gated, because it is
+        // the discriminator for the "#276 dead slot" families (link down vs
+        // bus renumbering) and costs one config pass per bridge. The dead
+        // function itself has nothing to read (its config space is what
+        // returns 0xffff); the state that explains it lives up here.
+        #[cfg(feature = "tx")]
+        if class >> 8 == 0x06 && class & 0xff == 0x04 {
+            let d = read_port_diag(&pci);
+            let st = decode_port_state(
+                d.pmcsr,
+                d.lnkctl,
+                d.lnksta,
+                ((d.buses >> 8) & 0xff) as u8,
+                None,
+            );
+            info!(
+                "PORT-DIAG: {seg:04x}:{bus:02x}:{dev:02x}.{fun} buses={:#010x} pmcsr={:?} lnkctl={:?} lnksta={:?} lnkcap={:?} bcr={:?} | D{} ldis={} LA={} spd=x{} w=x{} secbus=0x{:02x}",
+                d.buses, d.pmcsr, d.lnkctl, d.lnksta, d.lnkcap, d.bcr,
+                st.d_state, st.link_disable as u8, st.link_active as u8, st.speed, st.width,
+                st.sec_bus
             );
         }
 

@@ -14,10 +14,13 @@ use uefi::CStr16;
 mod acpi_dump;
 mod banner;
 mod chainload;
+mod ebswatch;
 mod gop;
 mod keywait;
 mod logging;
 mod pci;
+#[cfg(feature = "tx")]
+mod revive;
 mod sample;
 mod identity;
 mod identity_core;
@@ -343,6 +346,25 @@ fn main() -> Status {
         }
     }
 
+    // Phase: EBS-WATCH (soft-lock family cross-review 2026-11-22, issues
+    // #242/#278/#279): with \tx-ebs-watch.txt on the stick, wrap
+    // gBS->ExitBootServices + GetMemoryMap and arm the BeforeEBS/EBS-notify
+    // fanout checkpoints before any OS loader is started, so the handoff
+    // that has so far only been reconstructed statically gets OBSERVED at
+    // runtime (enter / fanout stages / return, MapKey counters, committed
+    // \ebs-watch.log + framebuffer rows + POST/UART channels). Inert probe
+    // without the marker. \tx-ebs-selftest.txt turns the chain point into a
+    // self-call of the wrapped EBS (validates the instrument without
+    // booting Windows; parks on success).
+    ebswatch::install_if_marker();
+    if ebswatch::selftest_if_marker() {
+        // Getting here means the self-test's own EBS call FAILED (success
+        // parks forever inside selftest): boot services are still alive,
+        // so the session continues into the normal chain instead of being
+        // wasted.
+        info!("CHAIN: ebs-selftest fell through (EBS did not succeed) - continuing into the normal chain");
+    }
+
     // Phase: CHAIN. Read-only LoadImage/StartImage of the ESP bootmgfw.efi.
     // The verdict lines above are in \loader.log; no pause before handing
     // off (the log file is the evidence record, not the screen).
@@ -443,7 +465,11 @@ enum CardOutcome {
 /// caller (`main`) must not chain-load Windows.
 #[cfg(feature = "tx")]
 fn tx_phase(gpus: &[pci::FoundGpu]) -> bool {
-    let targets = pci::select_tx_targets(gpus);
+    // SLOT-REVIVE pre-pass (marker-gated, see revive.rs): revive dead
+    // downstream slots through their root ports before target selection.
+    // Inert without \tx-revive-dead-slot.txt (returns the input unchanged).
+    let gpus = revive::revive_dead_slots(gpus);
+    let targets = pci::select_tx_targets(&gpus);
     if targets.is_empty() {
         info!("TX: no transaction target (selection marker refused, or no supported GPU) - chain-loading unchanged Windows");
         return false;
@@ -652,6 +678,34 @@ so no transaction was attempted and nothing was written"
             return CardOutcome::NotAttempted;
         }
     };
+
+    // \tx-agitate-only.txt (soft-lock family cross-review 2026-11-22,
+    // issues #242/#278/#279): the full-surgery ZERO-GPU-write negative
+    // control - detach + EXCLUSIVE claim + COMMAND writes + the DMA
+    // allocations at the transaction's sizes + bridge BME + native-GOP
+    // rebuild + reconnect all run; NOTHING touches BAR0 (no reset, no
+    // FWSEC, no booter, no selectors, no canary, no FLR - and no emergency
+    // FLR on the error path either). This is the control the field matrix
+    // was missing: every earlier zero-write arm skipped the whole surgery,
+    // so "zero-write boots / transaction freezes" could not separate
+    // "the unlocked GPU's live state poisons the handoff" from "our UEFI
+    // surgery poisons it". A freeze under this marker indicts the surgery;
+    // a clean boot leaves the live GPU state as the remaining suspect.
+    if tx::probe_file("\\tx-agitate-only.txt") {
+        info!("TX: \\tx-agitate-only.txt present - full-surgery zero-write control instead of the transaction (see run_agitate_only's contract)");
+        let mut agitate_bridge = None;
+        let outcome = tx::run_agitate_only(&gpu, &assets, g.handle, &mut agitate_bridge);
+        match outcome {
+            Ok(()) => {
+                info!("SELECTOR RESULT: agitate-only control complete (zero GPU writes by contract)");
+            }
+            Err(e) => {
+                info!("TX-AGITATE: control outcome: {e:?} (no emergency FLR - zero-write contract)");
+            }
+        }
+        tx::handoff_out(&pci);
+        return CardOutcome::Attempted;
+    }
 
     // BridgeMaster guard slot: run_transaction fills it mid-transaction (after
     // WprMeta publication) and releases it on the clean success tail. On a

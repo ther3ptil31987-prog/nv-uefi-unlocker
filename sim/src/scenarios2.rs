@@ -564,6 +564,121 @@ fn t40_fbif_dead_after_run_flr_retry_recovers() {
     );
 }
 
+/// FWSEC-FALLBACK (issues #89/#275): the GSP Falcon FBIF->sysmem aperture
+/// does not deliver - the first FWSEC attempt dies with the WPR2-never
+/// residue and the loader retries ONCE with VRAM staging (the aperture
+/// that still works on that host class). Field basis: the #89 marker round
+/// (v2.1.9, WPR2 UP 3ms, 20.6->33.7 TFLOPS) and the #275 marker round
+/// (2026-11-21, B760M-A + 2060 12GB, "Resolved").
+#[test]
+fn t41_fwsec_aperture_dead_vram_fallback_recovers() {
+    let mut gpu = FakeGpu::new_locked_cold(None);
+    let mut tx =
+        Transaction::new(&mut gpu, Faults { sysmem_aperture_dead: true, ..Default::default() });
+    let report = tx.run().expect("the VRAM-staged retry must carry the boot");
+    assert!(report.unwind_clean && report.selectors_written);
+    assert!(
+        tx.log().iter().any(|l| l.contains("FWSEC-FALLBACK: WPR2-never")),
+        "the A-class gate line must be on the log"
+    );
+    assert!(
+        tx.log().iter().any(|l| l.contains("VRAM-staged re-ignition verified")),
+        "the VRAM vehicle completion line must be on the log"
+    );
+    let gate_hits =
+        tx.log().iter().filter(|l| l.contains("FWSEC-FALLBACK: WPR2-never")).count();
+    assert_eq!(gate_hits, 1, "the gate must fire exactly once, got {gate_hits}");
+}
+
+/// Negative control: a DIFFERENT FWSEC death (alien WPR2 geometry - the
+/// fetch DELIVERED, the install is wrong) must not fire the aperture
+/// fallback; the canonical failure path stands.
+#[test]
+fn t42_wpr2_mismatch_does_not_fire_aperture_fallback() {
+    let mut gpu = FakeGpu::new_locked_cold(None);
+    let mut tx = Transaction::new(&mut gpu, Faults { wpr2_mismatch: true, ..Default::default() });
+    let err = tx.run().unwrap_err();
+    assert_eq!(err.phase, "fwsec");
+    assert!(err.reason.contains("WPR2 mismatch"), "{err:?}");
+    assert!(
+        !tx.log().iter().any(|l| l.contains("FWSEC-FALLBACK")),
+        "the aperture fallback must not fire on a delivered-but-wrong install"
+    );
+}
+
+/// Terminal path: the VRAM retry fails as well - the fallback must stay
+/// single-shot and the run ends in the canonical fwsec failure (no loop,
+/// no second FLR attempt).
+#[test]
+fn t43_vram_retry_also_fails_single_shot_terminal() {
+    let mut gpu = FakeGpu::new_locked_cold(None);
+    let mut tx = Transaction::new(
+        &mut gpu,
+        Faults { sysmem_aperture_dead: true, wpr2_mismatch: true, ..Default::default() },
+    );
+    let err = tx.run().unwrap_err();
+    assert_eq!(err.phase, "fwsec");
+    assert!(err.reason.contains("WPR2 mismatch"), "{err:?}");
+    let hits =
+        tx.log().iter().filter(|l| l.contains("FWSEC-FALLBACK: WPR2-never")).count();
+    assert_eq!(hits, 1, "the fallback must stay single-shot, got {hits}");
+}
+
+#[test]
+fn t_agitate_only_zero_write_control() {
+    // Loader analog of \tx-agitate-only.txt (run_agitate_only, soft-lock
+    // family cross-review 2026-11-22): the full surgery - detach+claim, DMA
+    // allocations at the transaction's sizes, bridge BME, console rebuild -
+    // with ZERO host writes to the GPU. Contract: the FakeGpu::writes ledger
+    // (every attempted write, PLM-dropped ones included) stays EMPTY, the
+    // unwind is clean, and no unlock phase (fwsec/booter/selectors/flr)
+    // fired.
+    let mut gpu = FakeGpu::new_locked_cold(None);
+    let mut tx = Transaction::new(&mut gpu, Faults::default());
+    tx.agitate_only = true;
+    let report = tx.run().expect("agitate-only happy path");
+    assert!(
+        !report.fwsec_fired && !report.booter_fired && !report.selectors_written && !report.flr_done,
+        "no unlock phase may fire in the control: {report:?}"
+    );
+    assert!(
+        report.unwind_clean && report.bme_restored,
+        "the surgery must unwind clean: {report:?}"
+    );
+    assert_eq!(
+        report.dma_pages_allocated, report.dma_pages_freed,
+        "allocation parity: everything allocated must be released"
+    );
+    assert!(
+        report.dma_pages_allocated >= 6,
+        "allocation parity: 5 transaction buffers + the radix block, got {}",
+        report.dma_pages_allocated
+    );
+    let claim_line_seen = tx.log().iter().any(|l| l.contains("agitate: detach+claim ok"));
+    drop(tx); // tx borrows gpu mutably; the ledger is read after the drop
+    assert!(
+        gpu.writes.is_empty(),
+        "the control must not write the GPU (host-write ledger): {:?}",
+        gpu.writes
+    );
+    assert!(claim_line_seen, "the detach+claim stage must be in the phase log");
+}
+
+#[test]
+fn t_agitate_only_alloc_fail_unwinds_no_writes() {
+    // The control's failure path: a DMA allocation failure aborts the run,
+    // the unwind drains what landed, and the GPU-write ledger STILL stays
+    // empty (no emergency FLR on this path - an FLR would violate the
+    // control's zero-write contract; loader analog: run_agitate_only's
+    // error arm).
+    let mut gpu = FakeGpu::new_locked_cold(None);
+    let mut tx = Transaction::new(&mut gpu, Faults { fail_alloc_at: Some(3), ..Default::default() });
+    tx.agitate_only = true;
+    let err = tx.run().unwrap_err();
+    assert_eq!(err.phase, "dma");
+    assert!(gpu.writes.is_empty(), "failure path must not write the GPU: {:?}", gpu.writes);
+}
+
 #[test]
 fn t_no_flr_ada_ablation() {
     // Loader analog of the loader-side no-flr skip: the FLR is state

@@ -1,4 +1,30 @@
-//! ssdiag v0.8.5 - in-OS NVIDIA register diagnosis + separate-lock re-apply.
+//! ssdiag v0.8.8 - in-OS NVIDIA register diagnosis + separate-lock re-apply.
+//! v0.8.8 opens --fuserows to Turing: the same fuse-controller block lives
+//! at 0x21000 there (envytools pfuse; family-auto base, --fusebase override
+//! for probing the second base). Turing runs degraded but honest: CRC_STATUS
+//! reads badf at PL0 so the CRC guard is off (announced; latch checks, two
+//! passes and address restore remain), IFF is unreadable so an explicit
+//! --fuserows=A-B range is required (capped at 512 rows, "domain unverified"
+//! warning). Same write class as before: row numbers + CMD_READ only.
+//! v0.8.7 adds --fuserows[=A-B] (WRITE MODE, user-approved): physical
+//! v0.8.7 adds --fuserows[=A-B] (WRITE MODE, user-approved): physical
+//! fuse-row capture ported from ga100-ff-tools read_rows - FUSEADDR row
+//! select + FUSECTRL CMD_READ only, idle/CRC_STATUS/FUSEDEBUG guards on
+//! every row (consumer-die values: CRC low byte 0x55 - GA100 reads bare
+//! 0x55, every consumer die 0x4555; FUSEDEBUG 0 GA100/GA10x or 0x400000
+//! Ada - strict GA100 equality aborted GA106/AD10x on the first real run),
+//! address latch verified, two passes compared, original address
+//! restored+verified on every path. Guard failure = diagnosed abort with
+//! zero writes; Turing self-refuses (CRC_STATUS badf, IFF PL0-blocked).
+//! Purpose: rison1337's desktop-4060 vs our 4060L FF-record pool comparison
+//! (rows 0x2ff..0x33f).
+//! v0.8.6 (#237 round 6, JeusChrit 11-21): GA100_SM_OVR face widened to the
+//! full 0x820a00..0x820b1c region (the live decoded island 0x820a40..0x820abc
+//! on AD102/AD103 - the RECONF-cancel layer per cmpunlocker PR#55/#58); new
+//! OBJFUSE_248 face sweeps the +0x248 companion words (0x821224, 0x8220c0/c4,
+//! 0x822100..0x82210c) so cut-L2 captures classify them; bank A relabeled
+//! die-constant (NOT GPC0 disable - 4090/4080 identical despite different
+//! GPC0 masks, coincidence proven).
 //! v0.8.5 fixes the tpc face semantics label (five-die SM-count check,
 //! #237 formula verification 2026-11-21): STATUS bit SET = TPC fused OFF,
 //! not present. The verdict lines already counted it this way (and matched
@@ -3816,9 +3842,28 @@ const OPT_FUSE_ROWS: [(&str, u32); 7] = [
 ];
 /// cmpunlocker PR#55's GA100 per-GPC SM override/status banks (0xff to
 /// 0x820a40+4*gpc, status at 0x820c38+4*gpc). On 20-40 series expect badf -
-/// the existence/nonexistence answer per die, read-only.
-const GA100_SM_OVR_BASE: u32 = 0x0082_0A40;
+/// the existence/nonexistence answer per die, read-only. Round 6 (JeusChrit
+/// 11-21): the OVR role in `RECONF & ~OVR` is THIS bank (0x820a40+4g),
+/// not the CTRL 0x820838 pair - and AD102/AD103 6-page dumps show a live
+/// decoded island 0x820a40..0x820abc (32 words, zero) between badf5040
+/// strips, so the face sweeps the full 0x820a00..0x820b1c region.
+const GA100_SM_OVR_BASE: u32 = 0x0082_0A00;
+const GA100_SM_OVR_ISLAND: u32 = 0x0082_0A40; // live decoded strip on Ada
+const GA100_SM_OVR_REGION_WORDS: u32 = 72; // 0x820a00..0x820b1c inclusive
 const GA100_SM_STATUS_BASE: u32 = 0x0082_0C38;
+/// #237 round 6: OBJFUSE +0x248 companion words (0x557bd4, called right
+/// after OBJFUSE +0x228 in 0x6c7334) - dispatch on fbp: 0x821224 one path,
+/// 0x8220c0/c4 for fbp<2, 0x822100+4*fbp for fbp>=2. All 0 on the AD103
+/// capture; swept here so cut-L2 captures (4090/3060) classify them.
+const OBJFUSE_248_ROWS: [(&str, u32); 7] = [
+    ("OBJ248_821224", 0x0082_1224),
+    ("OBJ248_FBP0", 0x0082_20C0),
+    ("OBJ248_FBP1", 0x0082_20C4),
+    ("OBJ248_FBP2", 0x0082_2100),
+    ("OBJ248_FBP3", 0x0082_2104),
+    ("OBJ248_FBP4", 0x0082_2108),
+    ("OBJ248_FBP5", 0x0082_210C),
+];
 
 /// GA100 VFI dictionary round (docs/reading-notes.md "GA100 电压故障注入
 /// (VFI) 考据", 2026-11-11). kate-land/ga100vfi published the GA100
@@ -4470,20 +4515,31 @@ fn dump_debug(rd: &dyn Fn(u32) -> u32, fam: &str) {
     // GA100 PR#55 SM banks: 8 dwords per row, badf values colored red (no
     // per-cell bucket text - columns stay aligned). On consumer dies the
     // whole row is the per-die existence answer. #237 round 4: on Ada the
-    // CTRL_OPT_TPC_GPC bank lives at 0x820838+4g (already in the TPC
-    // section below), so the GA100 0x820a40 sweep is labeled as such.
-    if fam == "ada" {
-        println!(
-            "  GA100_SM_OVR {} (GA100 bank; on Ada CTRL_OPT_TPC_GPC = 0x00820838+4g, see TPC section)",
-            off_h(GA100_SM_OVR_BASE)
-        );
-    } else {
-        println!("  GA100_SM_OVR {}", off_h(GA100_SM_OVR_BASE));
+    // Round 6: full OVR region sweep - guard strip / live island / tail
+    // strip, so the per-die island boundary maps itself. The island IS the
+    // OVR layer of `STATUS = OPT | (RECONF & ~OVR)` (cmpunlocker PR#55/#58
+    // wrote 0x820a40+4g to cancel RECONF cuts on GA100, +4 SM); the CTRL
+    // 0x820838 pair ORs disables and is not the OVR role.
+    println!(
+        "  GA100_SM_OVR_RGN {}..{} (guard/island/tail; island 0x820a40+4g = RECONF-cancel OVR per cmpunlocker#55/#58)",
+        off_h(GA100_SM_OVR_BASE),
+        off_h(GA100_SM_OVR_BASE + (GA100_SM_OVR_REGION_WORDS - 1) * 4)
+    );
+    for chunk in (0..GA100_SM_OVR_REGION_WORDS).step_by(8) {
+        let start = GA100_SM_OVR_BASE + chunk as u32 * 4;
+        let zone = if start < GA100_SM_OVR_ISLAND {
+            "guard"
+        } else if start < GA100_SM_OVR_ISLAND + 32 * 4 {
+            "island"
+        } else {
+            "tail"
+        };
+        print!("    [{zone}] {}", off_h(start));
+        for i in chunk..(chunk + 8).min(GA100_SM_OVR_REGION_WORDS) {
+            print!(" {}", cell_val(rd(GA100_SM_OVR_BASE + i as u32 * 4)));
+        }
+        println!();
     }
-    for gpc in 0..8u32 {
-        print!(" {}", cell_val(rd(GA100_SM_OVR_BASE + gpc * 4)));
-    }
-    println!();
     println!("  GA100_SM_STAT {}", off_h(GA100_SM_STATUS_BASE));
     for gpc in 0..8u32 {
         print!(" {}", cell_val(rd(GA100_SM_STATUS_BASE + gpc * 4)));
@@ -4542,12 +4598,14 @@ fn dump_debug(rd: &dyn Fn(u32) -> u32, fam: &str) {
                     None => String::new(),
                 }
             };
-            // #237 round 4 stale-GA100-label fixes: on Ada 0x8203a0..0x8203bc
-            // is the TPC-disable fuse bank A (not SYS_PIPE), and the GPC7
+            // #237 round 4 stale-GA100-label fixes, corrected round 6: bank A
+            // is NOT the GPC0 disable mask - 4090/4080 read identical
+            // 1,0,1,0 despite different GPC0 masks (0x3f vs 0x01), a proven
+            // coincidence - it is die-constant data of unknown role. The GPC7
             // defective/CP pair is a GA100-only layout (badf on Ada).
             let ada_note = if fam == "ada" {
                 if (0x0082_03A0..=0x0082_03B8).contains(off) {
-                    " [Ada: TPC disable bank A]"
+                    " [Ada bank A: die-constant, NOT GPC0 disable]"
                 } else if *name == "TPC_GPC7_DEFECTIVE" || *name == "TPC_GPC7_DISABLE_CP" {
                     " [GA100-only]"
                 } else {
@@ -4664,6 +4722,14 @@ fn dump_debug(rd: &dyn Fn(u32) -> u32, fam: &str) {
                 cell_val(s),
                 cell_val(e)
             );
+        }
+        // #237 round 6: OBJFUSE +0x248 companion words (0x557bd4 dispatch on
+        // fbp) - swept so cut-L2 captures classify them (all 0 on the AD103
+        // reference; nonzero on the 4090/3060 would make them the DEF-array
+        // candidate that round 4 failed to find at the DEF window).
+        println!("  OBJFUSE_248 (0x557bd4 paths: 0x821224; fbp<2 0x8220c0/c4; fbp>=2 0x822100+4f)");
+        for (name, off) in OBJFUSE_248_ROWS {
+            println!("    {name:<14} {}= {}", off_h(off), cell_val(rd(off)));
         }
         // Round-5 solve: FBPA_TRIM - the nonzero core 0x8211e8..0x8211fc is
         // per-FBPA mem/PHY trim fuses (app08 consumer copy merges into
@@ -5001,12 +5067,269 @@ fn main() {
     std::process::exit(code);
 }
 
+/// --fuserows range spec: A-B, hex (0x-prefix) or decimal.
+fn parse_row_range(spec: &str) -> Option<(u32, u32)> {
+    let (a, b) = spec.split_once('-')?;
+    let parse = |s: &str| -> Option<u32> {
+        let s = s.trim();
+        if let Some(h) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+            u32::from_str_radix(h, 16).ok()
+        } else {
+            s.parse::<u32>().ok()
+        }
+    };
+    let (a, b) = (parse(a)?, parse(b)?);
+    (a <= b).then_some((a, b))
+}
+
+/// Fuse-controller block bases - the same IP layout lives at two addresses:
+/// GA10x/Ada/Blackwell at 0x820000, Turing at 0x21000 (envytools pfuse:
+/// PFUSE array 0x021000 G80+; both bases read a plausible idle CTRL on the
+/// 2070 - 0x40040000 / 0xc0040000, state nibble 4, cmd 0 - and the block
+/// PLM 0x210f8 is OPEN there). Offsets inside the block are identical:
+/// +0 ctrl, +4 addr, +8 data, +0x50 iff, +0x60 debug, +0x70 crc.
+const FUSE_BASE_GA100_LAYOUT: u32 = 0x0082_0000;
+const FUSE_BASE_TURING: u32 = 0x0002_1000;
+const FUSE_CMD_READ: u32 = 0x1;
+const FUSE_CMD_MASK: u32 = 0x3;
+/// Bounded busy-wait per row: volatile MMIO reads are ~ns, so 2^20 without
+/// idle means the controller is not following the protocol - abort, not spin.
+const FUSE_SPIN_LIMIT: u32 = 1 << 20;
+/// Address-field sanity cap (envytools-era 9-bit fuse address; GA100 512).
+/// A Turing dump without readable IFF gets this as its hard bound.
+const FUSE_MAX_ROWS: u32 = 512;
+
+fn fuse_ctrl(base: u32) -> u32 { base }
+fn fuse_addr(base: u32) -> u32 { base + 0x4 }
+fn fuse_data(base: u32) -> u32 { base + 0x8 }
+fn fuse_iff(base: u32) -> u32 { base + 0x50 }
+fn fuse_debug(base: u32) -> u32 { base + 0x60 }
+fn fuse_crc(base: u32) -> u32 { base + 0x70 }
+
+/// One ff-tools guard round (idle + CRC + debug); Err = controller does not
+/// look like the read_rows protocol expects. `crc_readable=false` (Turing:
+/// CRC_STATUS reads badf at PL0) skips the CRC check - that degradation is
+/// decided once, before any write, and announced in the header.
+fn fuse_guard_ok(rd: &dyn Fn(u32) -> u32, base: u32, crc_readable: bool) -> Result<(), String> {
+    let ctrl = rd(fuse_ctrl(base));
+    if ctrl & 0xffff0000 == 0xbadf0000 {
+        return Err(format!("FUSECTRL reads {ctrl:#010x} (PRI error) - controller not accessible"));
+    }
+    if ctrl == 0xFFFF_FFFF {
+        return Err("FUSECTRL reads all-ones - not decoded/accessible here".into());
+    }
+    if (ctrl >> 16) & 31 != 4 || ctrl & FUSE_CMD_MASK != 0 {
+        return Err(format!(
+            "FUSECTRL {ctrl:#010x} not idle (state={} cmd={})",
+            (ctrl >> 16) & 31,
+            ctrl & FUSE_CMD_MASK
+        ));
+    }
+    let crc = rd(fuse_crc(base));
+    if crc_readable {
+        // GA100 reads bare 0x55 (ff-tools full-word check); EVERY consumer
+        // die observed reads 0x4555 (GA106 live 2026-11-22 user run +
+        // GA102/AD103/AD107/AD102 archived) - the low byte is the ready
+        // signature, upper bits carry die-dependent status. Strict equality
+        // was GA100-tuned and aborted GA10x/Ada before any row.
+        if crc & 0xff != 0x55 {
+            return Err(format!("CRC_STATUS {crc:#010x} - low byte != 0x55"));
+        }
+    }
+    let dbg = rd(fuse_debug(base));
+    if dbg & 0xffff0000 == 0xbadf0000 || dbg == 0xFFFF_FFFF {
+        return Err(format!("FUSEDEBUG {dbg:#010x} unreadable - debug state unknown"));
+    }
+    // Two observed-normal values: 0 on GA100/GA10x, 0x400000 on Ada
+    // (4060L/4090/2860, identical locked and unlocked). Anything else is an
+    // unknown debug state - ff-tools's concern stands: row data could be
+    // falsified, so abort rather than guess bit semantics we don't have.
+    if dbg != 0 && dbg != 0x0040_0000 {
+        return Err(format!(
+            "FUSEDEBUG {dbg:#010x} not a known-normal value (0 GA100/GA10x, 0x400000 Ada) - possible debug mode, row data could be falsified"
+        ));
+    }
+    Ok(())
+}
+
+fn fuse_wait_idle(rd: &dyn Fn(u32) -> u32, base: u32) -> Result<(), String> {
+    for _ in 0..FUSE_SPIN_LIMIT {
+        let ctrl = rd(fuse_ctrl(base));
+        if (ctrl >> 16) & 31 == 4 && ctrl & FUSE_CMD_MASK == 0 {
+            return Ok(());
+        }
+    }
+    Err("controller never returned to idle within the spin limit".into())
+}
+
+/// #237 round 6 (--fuserows, WRITE MODE): physical fuse-row capture, ported
+/// from ga100-ff-tools read_rows (kate-land public capture) with every
+/// guard. Writes are ONLY: row numbers to FUSEADDR (latch-verified) and
+/// CMD_READ to FUSECTRL - no programming command exists on this path, and
+/// the original FUSEADDR is restored + verified on every exit path. Any
+/// guard failure aborts with a diagnosis; the gathered pass-1 prefix prints
+/// with an INCOMPLETE marker. Returns (rows, complete) - complete means both
+/// passes finished AND the address was restored; the caller bumps rc on
+/// false. `base` selects the controller block (0.8.8: Turing at 0x21000,
+/// family-auto, --fusebase override). Turing degradations: CRC_STATUS reads
+/// badf at PL0 -> CRC guard disabled (announced; latch + two-pass + restore
+/// remain active) and IFF is unreadable -> explicit range required, capped
+/// at FUSE_MAX_ROWS with a "domain unverified" warning.
+fn fuse_row_dump(
+    rd: &dyn Fn(u32) -> u32,
+    wr: &dyn Fn(u32, u32),
+    range: Option<(u32, u32)>,
+    base: u32,
+) -> (Vec<(u32, u32)>, bool) {
+    println!("--- FUSE ROW DUMP (WRITE MODE) - writes: FUSEADDR row numbers + FUSECTRL CMD_READ only; no programming command; address restored after ---");
+    println!("  protocol: ga100-ff-tools read_rows (two passes, latch checks); a bound kernel driver is a concurrency risk - pass mismatches mark rows unreliable");
+    println!("  controller base: {base:#010x} (block-relative registers)");
+    let mut fail: Option<String> = None;
+    // Preconditions, zero writes so far.
+    // CRC readability is decided once: badf/all-ones = degraded mode.
+    let crc_word = rd(fuse_crc(base));
+    let crc_readable = !(crc_word & 0xffff0000 == 0xbadf0000 || crc_word == 0xFFFF_FFFF);
+    if let Err(e) = fuse_guard_ok(rd, base, crc_readable) {
+        println!("  {} {e} - no writes performed", red("FUSEROWS ABORT:"));
+        return (Vec::new(), false);
+    }
+    if !crc_readable {
+        println!(
+            "  {}: CRC_STATUS {crc_word:#010x} unreadable at this base (Turing: undecoded/PLM-blocked at PL0) - proceeding WITHOUT the CRC guard; latch verification, two passes and address restore remain active",
+            red("FUSEROWS DEGRADED:")
+        );
+    }
+    let saved = rd(fuse_addr(base));
+    if saved & 0xffff0000 == 0xbadf0000 || saved == 0xFFFF_FFFF {
+        println!("  {} FUSEADDR {saved:#010x} unreadable - no writes performed", red("FUSEROWS ABORT:"));
+        return (Vec::new(), false);
+    }
+    if saved >= FUSE_MAX_ROWS {
+        println!(
+            "  {} FUSEADDR {saved} outside the {FUSE_MAX_ROWS}-row address field - controller not in the expected state, no writes performed",
+            red("FUSEROWS ABORT:")
+        );
+        return (Vec::new(), false);
+    }
+    let iff = rd(fuse_iff(base));
+    let iff_readable = !(iff & 0xffff0000 == 0xbadf0000 || iff == 0xFFFF_FFFF);
+    let (first, last_row) = if iff_readable {
+        let (_, last) = iff_decode(iff);
+        if saved > last {
+            println!(
+                "  {} FUSEADDR {saved} outside the IFF domain 0..{last} - controller not in the expected state, no writes performed",
+                red("FUSEROWS ABORT:")
+            );
+            return (Vec::new(), false);
+        }
+        match range {
+            None => (0, last),
+            Some((a, b)) if b <= last => (a, b),
+            Some((a, b)) => {
+                println!("  {} range {a:#x}-{b:#x} exceeds the IFF domain 0..{last}", red("FUSEROWS ABORT:"));
+                return (Vec::new(), false);
+            }
+        }
+    } else {
+        // No IFF on this die: domain unverified. An explicit range is
+        // mandatory; out-of-domain rows read junk, not harm (read-class),
+        // and the latch check catches a controller that refuses addresses.
+        let Some((a, b)) = range else {
+            println!("  {} IFF_RECORD {iff:#010x} unreadable and no explicit range given - pass --fuserows=A-B (capped at {FUSE_MAX_ROWS} rows); no writes performed", red("FUSEROWS ABORT:"));
+            return (Vec::new(), false);
+        };
+        if b >= FUSE_MAX_ROWS {
+            println!("  {} range {a:#x}-{b:#x} exceeds the {FUSE_MAX_ROWS}-row address cap", red("FUSEROWS ABORT:"));
+            return (Vec::new(), false);
+        }
+        println!(
+            "  {}: IFF_RECORD {iff:#010x} unreadable - row domain UNVERIFIED, dumping the requested {a:#x}..{b:#x}; out-of-domain rows read junk, not harm",
+            red("FUSEROWS DEGRADED:")
+        );
+        (a, b)
+    };
+    println!(
+        "  domain: rows {first}..{last_row} (IFF {}{saved_note}) - two passes",
+        hx32(iff),
+        saved_note = format!(", saved FUSEADDR {saved}")
+    );
+    let mut passes: [Vec<u32>; 2] = [Vec::new(), Vec::new()];
+    'passes: for (p, buf) in passes.iter_mut().enumerate() {
+        for row in first..=last_row {
+            if let Err(e) = fuse_guard_ok(rd, base, crc_readable) {
+                fail = Some(format!("pass {} row {row}: {e}", p + 1));
+                break 'passes;
+            }
+            wr(fuse_addr(base), row);
+            if rd(fuse_addr(base)) != row {
+                fail = Some(format!("pass {} row {row}: FUSEADDR did not latch", p + 1));
+                break 'passes;
+            }
+            wr(fuse_ctrl(base), FUSE_CMD_READ);
+            if let Err(e) = fuse_wait_idle(rd, base) {
+                fail = Some(format!("pass {} row {row}: {e}", p + 1));
+                break 'passes;
+            }
+            let v = rd(fuse_data(base));
+            if v & 0xffff0000 == 0xbadf0000 {
+                fail = Some(format!("pass {} row {row}: FUSEDATA {v:#010x} (PRI error)", p + 1));
+                break 'passes;
+            }
+            buf.push(v); // all-ones is a legal OTP word, kept verbatim
+        }
+    }
+    // Restore + verify on every path - the one line that must never be silent.
+    wr(fuse_addr(base), saved);
+    let restored = rd(fuse_addr(base)) == saved;
+    if !restored {
+        println!(
+            "  {}: original FUSEADDR {saved} DID NOT RESTORE (reads {}) - investigate before trusting anything else",
+            red("FUSEROWS RESTORE FAILED"),
+            hx32(rd(fuse_addr(base)))
+        );
+    }
+    let complete = fail.is_none() && restored;
+    match (&fail, complete) {
+        (Some(f), _) => println!("  {} {f} - gathered prefix below, INCOMPLETE", red("FUSEROWS ABORT:")),
+        (None, true) => println!("  {} both passes complete, address restored", green("FUSEROWS OK:")),
+        _ => {}
+    }
+    let mismatches: Vec<usize> = if complete {
+        (0..passes[0].len()).filter(|&i| passes[0][i] != passes[1][i]).collect()
+    } else {
+        Vec::new()
+    };
+    if complete && mismatches.is_empty() {
+        println!("  two passes match ({} rows)", passes[0].len());
+    } else if complete {
+        println!(
+            "  {} {} row(s) differ between passes - treat as unreliable",
+            red("PASS MISMATCH:"),
+            mismatches.len()
+        );
+        for &i in mismatches.iter().take(16) {
+            println!(
+                "    row {:#x}: pass1 {} pass2 {}",
+                first + i as u32,
+                hx32(passes[0][i]),
+                hx32(passes[1][i])
+            );
+        }
+    }
+    for (i, &v) in passes[0].iter().enumerate() {
+        println!("FUSEROW {:#x} = {}", first + i as u32, hx32(v));
+    }
+    (passes[0].iter().enumerate().map(|(i, &v)| (first + i as u32, v)).collect(), complete)
+}
+
 fn run() -> i32 {
     let mut reapply = false;
     let mut dry = false;
     let mut inv_only = false;
     let mut sb_arm = false;
     let mut sb_disarm = false;
+    let mut fuserows: Option<Option<(u32, u32)>> = None;
+    let mut fuse_base: Option<u32> = None;
     let mut select: Option<String> = None;
     let mut args = std::env::args().skip(1);
     if std::env::var_os("SSDIAG_TIMING").is_some() {
@@ -5015,6 +5338,30 @@ fn run() -> i32 {
     while let Some(a) = args.next() {
         match a.as_str() {
             "--reapply" => reapply = true,
+            "--fusebase" => {
+                let v = args.next().unwrap_or_else(|| {
+                    eprintln!("--fusebase requires a hex offset, e.g. --fusebase 0x21000");
+                    std::process::exit(2);
+                });
+                match u32::from_str_radix(v.trim_start_matches("0x").trim_start_matches("0X"), 16) {
+                    Ok(b) if b > 0 && b + 0x100 < 0x0100_0000 => fuse_base = Some(b),
+                    _ => {
+                        eprintln!("bad --fusebase {v:?}; need a BAR0-relative hex offset inside the 16 MiB aperture");
+                        std::process::exit(2);
+                    }
+                }
+            }
+            "--fuserows" => fuserows = Some(None),
+            other if other.starts_with("--fuserows=") => {
+                let spec = &other["--fuserows=".len()..];
+                match parse_row_range(spec) {
+                    Some(r) => fuserows = Some(Some(r)),
+                    None => {
+                        eprintln!("bad range {spec:?}; use A-B, hex or decimal (e.g. --fuserows=0x2ff-0x33f)");
+                        std::process::exit(2);
+                    }
+                }
+            }
             "--safeboot-arm" => sb_arm = true,
             "--safeboot-disarm" => sb_disarm = true,
             "--timing" => TIMING.store(true, std::sync::atomic::Ordering::Relaxed),
@@ -5029,6 +5376,17 @@ OPTIONS:
   --reapply        per card with an OPEN FEAT gate: write SS0=0x88888888
                    SS1=0x8 and verify by read-back (separate-lock method -
                    restores an unlock the driver re-derived, no reboot)
+  --fuserows[=A-B] WRITE MODE per card: physical fuse-row capture via the
+                   guarded ga100-ff-tools read_rows protocol (FUSEADDR row
+                   select + FUSECTRL CMD_READ only, latch checks, two
+                   passes, original address restored+verified). Range A-B
+                   accepts hex/decimal; default = whole IFF row domain.
+                   Guard failures abort with zero writes (#237 round 6)
+  --fusebase <hex> controller block base override (default: family-auto -
+                   Turing 0x21000, GA10x+/Ada 0x820000; same block layout).
+                   Turing runs degraded: CRC_STATUS unreadable at PL0 (CRC
+                   guard off, announced) and IFF unreadable (explicit
+                   --fuserows=A-B required, capped at 512 rows)
   --select <s>     only cards whose DeviceID contains <s> (multi-GPU)
   --safeboot-arm   stage the probe driver for Safe Mode: hash-checked copy
                    to %ProgramData%, persistent service, and SafeBoot
@@ -5109,7 +5467,7 @@ SSDIAG_COLOR=force pins on.",
                 std::process::exit(2);
             }
             other => {
-                eprintln!("unknown arg {other:?}; usage: ssdiag [--reapply] [--select <substr>]");
+                eprintln!("unknown arg {other:?}; usage: ssdiag [--reapply] [--select <substr>] [--fuserows[=A-B]]");
                 return 2;
             }
         }
@@ -5408,6 +5766,19 @@ SSDIAG_COLOR=force pins on.",
                 if !ok {
                     rc = 1;
                 }
+            }
+        }
+        if let Some(range) = fuserows {
+            // 0.8.8: the fuse-controller block moved between generations -
+            // Turing carries it at 0x21000 (envytools pfuse), GA10x+ at
+            // 0x820000. Family-auto with --fusebase override (both bases
+            // read plausible idle CTRL on the 2070; the override exists
+            // exactly to probe the second base).
+            let base = fuse_base
+                .unwrap_or(if fam_name == "turing" { FUSE_BASE_TURING } else { FUSE_BASE_GA100_LAYOUT });
+            let (_rows, complete) = fuse_row_dump(&rd, &wr, range, base);
+            if !complete {
+                rc = 1;
             }
         }
         drv.unmap_physical(va);
@@ -5759,5 +6130,194 @@ mod tests {
         let (fam, regs) = family_of(0x166_000A1).unwrap();
         assert_eq!(fam, "turing");
         assert_eq!(regs[0].1, 0x0040_9650);
+    }
+
+    /// Behavior-level fuse-controller mock (ff-tools capture_io's "tests
+    /// inject an in-memory adapter, never a real device" idiom). FUSEDATA
+    /// reads derive from the latched FUSEADDR; CMD_READ makes FUSECTRL busy
+    /// for `busy_ticks` reads. Writes are asserted to the two permitted
+    /// forms only - the mock IS the write-discipline oracle.
+    struct FuseMock {
+        base: u32,
+        mem: std::cell::RefCell<std::collections::HashMap<u32, u32>>,
+        writes: std::cell::RefCell<Vec<(u32, u32)>>,
+        busy: std::cell::RefCell<u32>,
+        busy_ticks_init: u32,
+        latch_broken: bool,
+    }
+    impl FuseMock {
+        fn new(base: u32, saved_addr: u32, last_row: u32, busy_ticks: u32) -> Self {
+            let mut mem = std::collections::HashMap::new();
+            mem.insert(fuse_ctrl(base), (4 << 16) | 0); // idle: state 4, cmd IDLE
+            mem.insert(fuse_addr(base), saved_addr);
+            mem.insert(fuse_debug(base), 0);
+            mem.insert(fuse_crc(base), 0x55);
+            mem.insert(fuse_iff(base), (last_row << 16) | 0x2ff);
+            Self {
+                base,
+                mem: std::cell::RefCell::new(mem),
+                writes: std::cell::RefCell::new(Vec::new()),
+                busy: std::cell::RefCell::new(0),
+                busy_ticks_init: busy_ticks,
+                latch_broken: false,
+            }
+        }
+        fn rd(&self, off: u32) -> u32 {
+            if off == fuse_ctrl(self.base) {
+                let mut b = self.busy.borrow_mut();
+                if *b > 0 {
+                    *b -= 1;
+                    return (0 << 16) | FUSE_CMD_READ; // busy: state != 4
+                }
+                return (4 << 16) | 0;
+            }
+            if off == fuse_data(self.base) {
+                let a = *self.mem.borrow().get(&fuse_addr(self.base)).unwrap_or(&0);
+                return 0xAA00_0000 ^ a;
+            }
+            *self.mem.borrow().get(&off).unwrap_or(&0xFFFF_FFFF)
+        }
+        fn wr(&self, off: u32, v: u32) {
+            self.writes.borrow_mut().push((off, v));
+            assert!(
+                off == fuse_addr(self.base)
+                    || (off == fuse_ctrl(self.base) && v == FUSE_CMD_READ),
+                "mock refuses any write beyond row-select/CMD_READ: ({off:#x}, {v:#x})"
+            );
+            if off == fuse_ctrl(self.base) {
+                *self.busy.borrow_mut() = self.busy_ticks_init;
+            }
+            if off == fuse_addr(self.base) && self.latch_broken {
+                return; // write silently ignored: latch failure simulation
+            }
+            self.mem.borrow_mut().insert(off, v);
+        }
+        fn cmd_read_writes(&self) -> usize {
+            self.writes.borrow().iter().filter(|&&(o, v)| o == fuse_ctrl(self.base) && v == FUSE_CMD_READ).count()
+        }
+    }
+
+    #[test]
+    fn fuserows_happy_path_two_passes_and_restore() {
+        let m = FuseMock::new(FUSE_BASE_GA100_LAYOUT, 8, 9, 1); // domain 0..=9, saved addr 8
+        let rd = |off: u32| m.rd(off);
+        let wr = |off: u32, v: u32| m.wr(off, v);
+        let (rows, complete) = fuse_row_dump(&rd, &wr, None, FUSE_BASE_GA100_LAYOUT);
+        assert!(complete);
+        assert_eq!(rows.len(), 10);
+        assert_eq!(rows[3], (3, 0xAA00_0000 ^ 3));
+        assert_eq!(m.cmd_read_writes(), 20); // 10 rows x 2 passes
+        assert_eq!(*m.mem.borrow().get(&fuse_addr(FUSE_BASE_GA100_LAYOUT)).unwrap(), 8); // restored
+        // Last write is the address restore.
+        assert_eq!(*m.writes.borrow().last().unwrap(), (fuse_addr(FUSE_BASE_GA100_LAYOUT), 8));
+    }
+
+    #[test]
+    fn fuserows_range_subset() {
+        let m = FuseMock::new(FUSE_BASE_GA100_LAYOUT, 0, 0x33f, 1);
+        let rd = |off: u32| m.rd(off);
+        let wr = |off: u32, v: u32| m.wr(off, v);
+        let (rows, complete) = fuse_row_dump(&rd, &wr, Some((0x2ff, 0x303)), FUSE_BASE_GA100_LAYOUT);
+        assert!(complete);
+        assert_eq!(rows.len(), 5);
+        assert_eq!(rows[0].0, 0x2ff);
+        assert_eq!(rows[4].0, 0x303);
+        assert_eq!(m.cmd_read_writes(), 10);
+    }
+
+    #[test]
+    fn fuserows_precondition_failure_performs_zero_writes() {
+        let mut m = FuseMock::new(FUSE_BASE_GA100_LAYOUT, 8, 9, 1);
+        m.mem.borrow_mut().insert(fuse_crc(FUSE_BASE_GA100_LAYOUT), 0x54); // guard breaks
+        let rd = |off: u32| m.rd(off);
+        let wr = |off: u32, v: u32| m.wr(off, v);
+        let (rows, complete) = fuse_row_dump(&rd, &wr, None, FUSE_BASE_GA100_LAYOUT);
+        assert!(!complete);
+        assert!(rows.is_empty());
+        assert_eq!(m.writes.borrow().len(), 0, "no write may precede the guards");
+    }
+
+    #[test]
+    fn fuserows_latch_failure_aborts_before_cmd_read() {
+        let mut m = FuseMock::new(FUSE_BASE_GA100_LAYOUT, 8, 9, 1);
+        m.latch_broken = true;
+        let rd = |off: u32| m.rd(off);
+        let wr = |off: u32, v: u32| m.wr(off, v);
+        let (rows, complete) = fuse_row_dump(&rd, &wr, None, FUSE_BASE_GA100_LAYOUT);
+        assert!(!complete);
+        assert!(rows.is_empty());
+        // Exactly one row-select attempt + one restore, zero CMD_READs.
+        assert_eq!(m.cmd_read_writes(), 0);
+        let writes = m.writes.borrow();
+        assert_eq!(writes[0], (fuse_addr(FUSE_BASE_GA100_LAYOUT), 0));
+        assert_eq!(*writes.last().unwrap(), (fuse_addr(FUSE_BASE_GA100_LAYOUT), 8));
+    }
+
+    #[test]
+    fn fuserows_row_range_spec_parser() {
+        assert_eq!(parse_row_range("0x2ff-0x33f"), Some((0x2ff, 0x33f)));
+        assert_eq!(parse_row_range("10-20"), Some((10, 20)));
+        assert_eq!(parse_row_range("5-5"), Some((5, 5)));
+        assert_eq!(parse_row_range("9-3"), None);
+        assert_eq!(parse_row_range("0x2ff"), None);
+        assert_eq!(parse_row_range("x-y"), None);
+    }
+
+    #[test]
+    fn fuserows_consumer_die_guard_values_pass() {
+        // The observed consumer-die normal state: CRC_STATUS 0x4555 (GA106
+        // live run + GA102/AD103/AD107/AD102 archived), FUSEDEBUG 0x400000
+        // on Ada. 0.8.7's first real run aborted on GA106's 0x4555 because
+        // the equality was GA100-tuned.
+        let mut m = FuseMock::new(FUSE_BASE_GA100_LAYOUT, 8, 9, 1);
+        m.mem.borrow_mut().insert(fuse_crc(FUSE_BASE_GA100_LAYOUT), 0x0000_4555);
+        m.mem.borrow_mut().insert(fuse_debug(FUSE_BASE_GA100_LAYOUT), 0x0040_0000);
+        let rd = |off: u32| m.rd(off);
+        let wr = |off: u32, v: u32| m.wr(off, v);
+        let (rows, complete) = fuse_row_dump(&rd, &wr, None, FUSE_BASE_GA100_LAYOUT);
+        assert!(complete);
+        assert_eq!(rows.len(), 10);
+    }
+
+    #[test]
+    fn fuserows_unknown_debug_state_rejects_with_zero_writes() {
+        let mut m = FuseMock::new(FUSE_BASE_GA100_LAYOUT, 8, 9, 1);
+        m.mem.borrow_mut().insert(fuse_debug(FUSE_BASE_GA100_LAYOUT), 0x1); // not 0, not the Ada constant
+        let rd = |off: u32| m.rd(off);
+        let wr = |off: u32, v: u32| m.wr(off, v);
+        let (rows, complete) = fuse_row_dump(&rd, &wr, None, FUSE_BASE_GA100_LAYOUT);
+        assert!(!complete);
+        assert!(rows.is_empty());
+        assert_eq!(m.writes.borrow().len(), 0);
+    }
+
+    #[test]
+    fn fuserows_turing_degraded_guards_proceed_with_explicit_range() {
+        // The observed 2070 shifted-base state: CRC_STATUS badf (guard off,
+        // announced), IFF badf (explicit range mandatory). Latch + two-pass
+        // + restore stay active.
+        let mut m = FuseMock::new(FUSE_BASE_TURING, 0xff, 0x2ff, 1);
+        m.mem.borrow_mut().insert(fuse_crc(FUSE_BASE_TURING), 0xbadf_5040);
+        m.mem.borrow_mut().insert(fuse_iff(FUSE_BASE_TURING), 0xbadf_5040);
+        let rd = |off: u32| m.rd(off);
+        let wr = |off: u32, v: u32| m.wr(off, v);
+        let (rows, complete) = fuse_row_dump(&rd, &wr, Some((0, 3)), FUSE_BASE_TURING);
+        assert!(complete);
+        assert_eq!(rows.len(), 4);
+        assert_eq!(m.cmd_read_writes(), 8); // 4 rows x 2 passes
+        assert_eq!(*m.mem.borrow().get(&fuse_addr(FUSE_BASE_TURING)).unwrap(), 0xff); // restored
+    }
+
+    #[test]
+    fn fuserows_turing_iff_unreadable_requires_explicit_range() {
+        let mut m = FuseMock::new(FUSE_BASE_TURING, 0xff, 0x2ff, 1);
+        m.mem.borrow_mut().insert(fuse_crc(FUSE_BASE_TURING), 0xbadf_5040);
+        m.mem.borrow_mut().insert(fuse_iff(FUSE_BASE_TURING), 0xbadf_5040);
+        let rd = |off: u32| m.rd(off);
+        let wr = |off: u32, v: u32| m.wr(off, v);
+        let (rows, complete) = fuse_row_dump(&rd, &wr, None, FUSE_BASE_TURING);
+        assert!(!complete);
+        assert!(rows.is_empty());
+        assert_eq!(m.writes.borrow().len(), 0, "no range, no writes");
     }
 }
