@@ -103,6 +103,10 @@ maker 不带参数运行时自动识别制盘机上的 NVIDIA 显卡代际，只
 | `tx-low-staging.txt` / `tx-fwsec-high-staging.txt` | staging 带手工钉死：前者把 booter 组（meta/签名/radix/boot）整体压到 <4GiB，后者把 FWSEC staging 挪回高区（FWSEC 自 v2.1.8 默认低位）。**自 v2.1.12-rc1 起带自动回退（STAGING-FALLBACK）**：Turing 的 HIGH 默认下若 booter `0x89` 且宿主 meta magic 完好（=写侧落盘、读侧未送达，[#74](https://github.com/physicsdolphin/nv-uefi-unlocker/issues/74)/[#156](https://github.com/physicsdolphin/nv-uefi-unlocker/issues/156)/[#191](https://github.com/physicsdolphin/nv-uefi-unlocker/issues/191) 类），自动单次低位重试——无 FLR、单发无循环；`0x91`（[#16](https://github.com/physicsdolphin/nv-uefi-unlocker/issues/16) 反向 sub-4GB 读锁类）与宿主 magic 损坏不触发，回退也失败则走原失败路径并提示查 VT-d。带要求按机器双向分化，判例表见[兼容矩阵](compatibility.md)。**FWSEC 侧的同形自动回退也已落地（FWSEC-FALLBACK，2026-11-22）**：主链 FWSEC 点火死于 A 类指纹（WPR2-never + 空窗残影 `0x1ffffe00/0` + `CPUCTL=0` + EXCI 低 16 位 `0x3ff`——GSP Falcon FBIF→sysmem 孔径失效，[#89](https://github.com/physicsdolphin/nv-uefi-unlocker/issues/89)/[#275](https://github.com/physicsdolphin/nv-uefi-unlocker/issues/275) 双机）时，免 marker 单次函数级 FLR + BME 重臂 + VRAM staging 重点火；重试再死走原失败路径；`\tx-fwsec-vram-staging.txt` 已在位（手动 VRAM 先手）时不触发。健康台架无法真机复现该孔径失效——触发器的真机验证依赖两台无 marker 复测（sim t41–t43 覆盖门控逻辑：触发/负控/终态单发） |
 | `tx-acpi-dump.txt` | 只读：把固件 DSDT 与全部 SSDT 连同关键词索引落到卷根 `\acpi\`（离线 `iasl -d` 反编译；回答"谁在管这张卡的电"）。确认键之前执行，没有 N 卡也生效 |
 | `tx-exit-fw.txt` | **退出阀**（[PR #209](https://github.com/physicsdolphin/nv-uefi-unlocker/pull/209)，issue #208 A 线）：跳过链式 `bootmgfw`，事务完成后直接交回固件引导管理器、由固件按 BootOrder 原生引导 Windows。适用于链载 `bootmgfw` 报 `\BCD` 0xc0000034 的机器（MSI GP66 11UG/AMI 实证：路径/卷/映像字节全精确仍死=bootmgfw 内部启动上下文差异，只能让固件自己拉）。**前提**：固件持久 BootOrder 里 Windows Boot Manager 须排在 U 盘之前，否则循环回 U 盘；一次性启动菜单进入则正常落穿。中止路径（30 秒超时/按错键）同样过此检查，marker 存在时中止也交回固件——链路坏掉的机器上这反而是更好行为（链载会落到 Recovery 屏）。marker 同置时事务前预载自动跳过 |
+| `tx-revive-dead-slot.txt`（tx 构建） | **死槽复活阶梯**（[#276](https://github.com/physicsdolphin/nv-uefi-unlocker/issues/276)，现场验证 2026-11-23）：对枚举读 vendor 0xffff 的死槽执行——ROM 身份门（固件缓存影子的 PCIR 读 vendor/device，只对 N 卡执行并打印死槽身份；无 ROM 的设备一律 decline）→ 杠杆阶梯 PMCSR→D0 / 清 Link Disable / **总线号恢复**（重编号族）/ **Secondary Bus Reset**（每级读回验证，复活只认 vendor 读回）。死槽自有 console GOP 在任何复位前自动断联（GOP 绑定态 SBR=黑屏卡死，台架实证）。复活后从固件簿记（GetBarAttributes）恢复 BAR，**复活槽保留候选表、同 boot 交易**。无 ROM 的死槽（桥类）会被身份门 decline |
+| `tx-revive-force-sbr.txt`（tx 构建） | **FORCE-SBR 强推档**：对「悖论端口」（端口全绿但子端 0xffff、总线号一致）绕过保守 decline 强制 SBR。台架三连阴性教训在档：软死桥扛过 SBR（链路重训、config 仍死）——对软死设备无效，对真断电/链路关闭设备才有效 |
+| `tx-sbr-gpu.txt`（tx 构建） | **GPU-SBR 纪律窗口实验**：事务内（detach+claim 之后、FWSEC 之前——驱动已断/console 已静默/零解锁）对目标卡父口强制 Secondary Bus Reset，claim-baseline 全量 config 恢复 + MMIO 芯片身份实证后事务继续。**GPU 的 SBR 只能在 GOP 断联后执行**（GOP 绑定态 SBR=黑屏卡死）——本版为结构性保证。桌面诊断/研究用 |
+| PORT-DIAG（无条件） | 无 marker：枚举时每个 PCI-PCI 桥/根口一行寄存器快照（PMCSR/LnkCap/LnkCtl/LnkSta/Bridge Control + **当前**总线号），死功能行（vendor 0xffff）无条件记录。判别「链路真关闭（D3hot/LinkDisable/L2L3-Ready）vs 总线号隐藏（DLLLA=1 + 当前 bus ≠ 句柄创建 bus）」两家族——[#276](https://github.com/physicsdolphin/nv-uefi-unlocker/issues/276) 现场即由它裁决 |
 
 无自动运行标记时，事务只接受空格或回车确认，其他键或 30 秒超时均中止。链回顺序为 Windows Boot Manager → 受支持的 Linux shim/grub/systemd-boot/Limine → 通用 `EFI/BOOT/BOOTX64.EFI`；最后一档提供 5 秒按键退出窗口。慢速 console 的提速走 `tx-quiet.txt` 的 console 白名单（issue #38），不做异步输出——UEFI 引导服务单线程，GOP 文本渲染本身是同步调用，异步提不了吞吐；每行日志带 `[+ms]` 阶段计时前缀，回显耗时与事务等待在 `loader.log` 里直接可分。
 
@@ -187,6 +191,8 @@ TU106 + GSP 模式有休眠恢复后成功交棒的实测，但这不能代替�
 
 先核对系统侧选择器和电源状态。RTD3 让空闲 GPU 进入 D3cold 时会清除易失解锁；EFI 读回成功不能证明状态在系统内一直保留。
 
+**系统内寄存器探针的内核前提（2026-11-23，[#246](https://github.com/physicsdolphin/nv-uefi-unlocker/issues/246) 实证）**：`tools/diag-unlock.py` 经 sysfs `resource0` mmap 直读 BAR0——在 `CONFIG_IO_STRICT_DEVMEM=y` 的内核（Arch/Manjaro 式配置；Ubuntu generic 未启用）上，被驱动占用的 BAR 一律拒绝映射（EINVAL，root 亦然；机制=pci-sysfs 的 `iomem_is_exclusive` 检查，读写同生死）。判据一行：`grep -E "CONFIG_(IO_)?STRICT_DEVMEM" /boot/config-$(uname -r)`；解法=内核命令行加 `iomem=relaxed`（**无运行时开关**——该变量仅由 `iomem=` 引导参数设置，root 不可热改；读写同开、含 /dev/mem）。工具在 mmap EINVAL 时会打印本提示。
+
 若发行版在 `/usr/lib/modprobe.d/nvidia-runtimepm.conf` 启用 `NVreg_DynamicPowerManagement=0x02`，可在 `/etc/modprobe.d/` 使用同名文件覆盖。先备份已有配置：
 
 **一键脚本**：`sudo bash tools/disable-rtd3.sh`——实现本节全部步骤（同名覆盖+备份、设备级 `power/control=on` 立即生效、initramfs 工具探测、冲突文件点名、合并配置终检）；`--check` 只读体检当前状态。手工步骤如下：
@@ -247,6 +253,8 @@ sudo update-initramfs -u
 还有第三种情形，判据之外也值得知道：**解锁活着、负载也 compute-bound，但端到端 GEMM 数字仍明显低于裸管线口径**——CUDA 库的 kernel 自动选择按出厂半速硬件校准（完全静态的启发式表，感知不到解锁态），会给解锁后的卡选中偏小 tile 的次优 kernel（8×RTX 4090 实测：默认与库内最优差 1.2–1.9×，FP8 最甚）。这不影响[读回判定](#ssdiag)——硅态判据与应用侧读数是两回事；应用侧想回收这部分，可按形状实测遍历候选择优（autotune）或手写 CUTLASS，具体方法与各精度推荐配置见 [Harry-Chen/unlocked-ada-gemm](https://github.com/Harry-Chen/unlocked-ada-gemm) 与[原始博客](https://harrychen.xyz/2026/11/17/unlocked-rtx-4090-gemm-perf/)。
 
 **证据等级**：上表是一台桌面机（TB4 坞、驱动与场景见 #54）的结果，规则与其中的功耗判据一致；不同架构（如 Turing）的"满速"基准不同（`READOUT` 语义见 [读回判定](#ssdiag)），不要把这里的倍率直接套到别的卡上。
+
+**一个可复算的分解（[#281](https://github.com/physicsdolphin/nv-uefi-unlocker/issues/281)，2026-11-22）**：ComfyUI SDXL+LoRA 同机同种子，把四个工作负载的端到端比值代回 `r = 1/[(1−f)+f/1.86]`，解出**计算占比 44.6%（img2img 976×1248）/49.1%/52.3%/80.8%（txt2img+hires）**，以及**每图固定开销 12.8–15.3 s**（VAE、文本编码、搬运，基本与分辨率无关）。这解释了轻负载为何封顶 ~1.2–1.3×、重负载才接近 GEMM 上限；同批 9 对图像逐像素相同（max\|d\|=0）说明只改速度不改结果。**16 GB 主机的 offload 陷阱**也一并记下：ComfyUI 动态显存默认把模型放系统内存，内存紧张时每个提示重读 ~5 GB——340/750/793 s 单图（采样本身仍只有 40–52 s，750 s 一例卡在 VAE decode 11 分钟），强制 `--highvram` 回到稳定 46 s。这是最容易误判"解锁没生效"的形状。
 
 <a id="relock"></a>
 
@@ -396,6 +404,17 @@ dGPU 的电只有两种来源：桌面由插槽直供；笔记本/一体机的 d
 **离电（电池）启动的新边界（2026-11-22，G614JV 4060L 维护者侧实测）**：RTD3 被关闭（键或固件开关，两旋钮等价故边界共享）的**双显三模热切换机型**上，以**离电（电池）模式**启动时，EC 可能决定**启动阶段就不给 dGPU 上电**——进入系统后，被关掉 RTD3 的 GPU 无法正常启动，出现**内核态设备 PnP 阻塞**。事件签名如实转录，先后两段：先 `\Device\UVMLiteController0x1` 报 `timeout error waiting for NV_UFLUSH_FB_FLUSH = 0xffffffff cnt=320330/320169/xxxxxx`（`0xffffffff` 是 BAR 全 f 读数——卡不在供电态；第三段计数随现场变化）；随后 `nvlddmkm` **id=14 以每秒 10~20 次连发**：`\Device\UVMLiteController0x1 CMDre 000000XX 00003ffc ffffffff 00000007 ffffffff`（或尾部 `00fffffff`，XX=00~ff 递增计数）。**归类：双显三模热切换的副作用——平台电源管理限制**，不是工具或键的 bug：EC 的启动供电决策（电池模式省电）与被禁用的运行时 D3 叠加，驱动绑定到一台未上电的设备，FB flush 等待全 f 超时，PnP start 卡死。处置：这类机器**插电（外接电源）启动**——EC 正常给 dGPU 上电则一切照常；已卡死的现场先接 AC 再重启。与解锁无关：该形态发生在 stock 供电决策层，先于任何事务状态。
 
 **第三个平台、首个原生笔记本 `2520`，也是首例"已定性为驱动 bind 期复位"的机器仅靠该键转绿（2026-11-20，[#126](https://github.com/physicsdolphin/nv-uefi-unlocker/issues/126)）**：联想 IdeaPad Gaming 3 82K2（RTX 3060 Laptop `10de:2520`，GA106M，AMD 平台，根口 `00:01.1` = `1022:1633`，**无 MUX、零 dGPU 出线**，驱动 621.01）此前已积累六轮反例——NVCP 最高性能优先、ASPM AC=0、端点 D3Cold 退出项、根口类实例 `PnPCapabilities=24` + 根口 D3Cold 退出项、开机 60 s 内抢跑基准、驱动 591.86→621.01。run 7 的分量来自这段历史：前面的金丝雀轮已把丢失切成**两层叠加的凶手**——(a) **平台 `_PR3/_OFF` 断轨**，run 4 读到金丝雀 `cleared`、根口 `D3`；(b) **驱动 bind 期主动复位**，run 5 用根口退出项把轨保持住（根口 `D0`）后金丝雀**仍** `cleared`，run 6 在更新驱动上签名不变。run 7 只在 run 6 的注册表栈上加 `EnableRuntimePowerManagement=0`：EFI 日志照旧全绿，系统内 ssdiag 0.7.0 读到卡 `PMCSR=D0`、根口 `D0`、**金丝雀 `intact`**、`SS0=0x88888888`/`SS1=0x8` 活、`VERDICT [ampere]: UNLOCKED`；GEMM（8192³、FP32 累加、15 取中位）FP16 26.3–26.7 → **40.83 TFLOPS（+54%）**、BF16 26.6–26.8 → **42.20（+57%）**、FP32 对照平（8.58–8.62 → 8.60）；固定种子 SDXL（Forge，832×1216，25 步）25.3 s → **17.2–18.4 s（约 −30%）**，满载 73 °C / ~50 W / 1770 MHz。**这是该键首次在"轨已保住、复位仍发生"的现场作为唯一变量转绿**——它覆盖双层叠加形态里的两条机制，而不只是第 1 行的断轨。也是首个原生笔记本 `2520`、第三个 Windows 平台（Intel MSI / AMD Acer / AMD 联想）。边界：run 7 未记录撤掉前几轮的注册表开关，应按"run 6 + 键"读（对 run 6 单变量，不是从原厂态起的 A/B）；睡眠/S4 仍按设计清锁；键挂在驱动键下，驱动升级/重装后须复查重设。Linux 侧等价物仍是 `NVreg_DynamicPowerManagement=0x00`（[#230](https://github.com/physicsdolphin/nv-uefi-unlocker/issues/230)）。完整运行矩阵与读回：[`docs/evidence/issue126-82k2-2520/`](evidence/issue126-82k2-2520/README.md)。
+
+<a id="relock-revive"></a>
+
+### 实例记录：总线号隐藏族——死槽复活阶梯首战定谳（2026-11-23，[#276](https://github.com/physicsdolphin/nv-uefi-unlocker/issues/276)）
+
+Dell XPS 8940（0427JK，i7-11700，Rocket Lake-S）+ Dell OEM RTX 3060 Ti `10de:2486`（GA104）：**每次 UEFI boot 枚举时 PEG 槽读 vendor 0xffff**，loader 报 "no transaction target"；而卡全程驱动 console（DP/HDMI 双口验证）、Windows 里健康且编号 43:00.0。iasl 反解证明 DSDT/SSDT **无任何 ACPI 电源资源**管这条槽。这个家族的机理与「谁把解锁冲掉」（本章主线）完全不同——它发生在**枚举可见性**层：
+
+- **机理 = bus-number hiding（总线号隐藏）**：rc6 的 PORT-DIAG 一次裁决——PEG 口 `D0 / ldis=0 / DLLLA=1（Gen3 x16 训练着）/ secbus=0x00`，死功能句柄创建于 bus 2。固件在 boot-manager 阶段把端口的 **secondary/subordinate 总线寄存器清零**（config 隔离门），发往 bus 2 的 config TLP 失去路由 → master-abort → 0xffff。**卡从未复位也从未断电**：display engine 连续翻新（mem 窗口没动、scanout 自治）、链路稳定训练、config 内容含 BARs 原样存活在路由断点后面。Windows 43:00.0 = pci.sys 自己重编号写的新标签（Windows 自行枚举所以不受影响）。规范层面 spec-legal：sec/sub=0/0 即上电默认值，UEFI 对 handoff 时桥编号无不变量；行为假设是「下一个枚举者会自己重新发现设备」——Windows 会，通用工具不会。
+- **复活链（rc7，零复位零写入）**：`SLOT-REVIVE` 的 ROM 身份门从固件缓存影子读出 `vendor=0x10de device=0x2486 (NVIDIA)`（config 死了影子还在——它也是死槽 device ID 的唯一来源）→ `NoneRelocated` 杠杆把记录总线写回父口 sec/sub（`0x00000000 → 0x00020200`，读回验证）→ reprobe vendor `0x10de` = **路由隔离、从未死** → 槽保留候选表 → **交易在原始 bus-2 地址同 boot 运行**（Windows 接管后才变 43——这本身即重编号诊断的实证）→ 全链绿 → 系统内 `VERDICT [ampere]: UNLOCKED`、canary intact、双 `D0`。零复位、零 BAR 恢复——重编号族根本不需要那些杠杆。
+- **判别纪律**（PORT-DIAG，无条件）：DLLLA=1 + 当前 bus ≠ 句柄创建 bus = 重编号族（写回即活）；DLLLA=0 = 链路真关闭族（D3hot/LinkDisable/L2L3-Ready，SBR 阶梯）；DLLLA=1 + bus 一致 + 子端仍 0xffff = 软死族（台架 ASM1080 三连阴性：SBR 无效，需真实断电）。无 ROM 影子的死槽（桥类）被身份门 decline——不重置不可识别的设备。
+- 边界：单机 n=1；11-20 一晚该机曾正常枚举（门控按 boot 路径变量触发、变量未定位）；性能基准后续补录。证据：[`docs/evidence/issue276-xps8940-renumbering/`](evidence/issue276-xps8940-renumbering/README.md)。
 
 **独显直连分支的字段数据点（2026-11-21，[#273](https://github.com/physicsdolphin/nv-uefi-unlocker/issues/273)，`2860`/ASUS FA607PI）**：RTD3 键 absent（驱动默认允许 runtime D3）+ 独显直连（`display_active=Enabled`）的机器，解锁态两轮引导 + 负载下三采存活，与 maker/FAQ 预检的分级框一致（display-active 保活 → risk low while outputs stay on the card）；S3/休眠未测（同族 `2820` 的 [D#226 追评](https://github.com/physicsdolphin/nv-uefi-unlocker/discussions/226) = 睡眠抹除，预期行为）。
 
@@ -616,9 +635,9 @@ openssl x509 -in NVUEFI.crt -outform DER -out NVUEFI.cer
 
 5. **验证**：`mokutil --sb-state` 应为 `SecureBoot enabled`；固件真正放行的证据是盘上出现新的 `loader.log` 且含 TX banner。
 
-### 路线 B：MOK + shim（三台机报告，两台为台式机全流程）
+### 路线 B：MOK + shim（四台机报告，三台为台式机全流程）
 
-固件只校验微软签名的 shim；你的密钥通过 MOK 在 shim 之后生效，主板密钥库不动。依据是三份现场报告：[#162](https://github.com/physicsdolphin/nv-uefi-unlocker/issues/162)（2026-11 上旬，Secure Boot 开启、v2.1.10、RTX 30 笔记本、`ga102`，PK/KEK/db 未动）与 [#210](https://github.com/physicsdolphin/nv-uefi-unlocker/issues/210)（2026-11-08，RTX 3080 20GB + ASUS ROG Z790，官方 v2.1.10 原包 + 自加 `.sbat` + 自签 MOK，全链绿并交棒，系统内 `Confirm-SecureBootUEFI=True`、`MokListRT` 含证书、PK/KEK/db 不变），以及 [#241 追补](https://github.com/physicsdolphin/nv-uefi-unlocker/issues/241#issuecomment-6894516749)（2026-11-15，RTX 3090 桌面机，走下面的**哈希登记变体**并在活性 BitLocker 下三次受保护引导）；#162 的脚本仓 [J0s3f/nv-unlock-secureboot-esp](https://github.com/J0s3f/nv-unlock-secureboot-esp) 可作参考实现，未 vendor 进本仓库。#210 相对 #162 的增量是**可复算的补节参数**（第 3 步）与"倒计时必须按键"这一步（第 7 步），两者都只来自 #210；#241 追补的增量是**哈希登记变体 + 活性 BitLocker/TPM 度量侧经验**（见第 7 步之后）。
+固件只校验微软签名的 shim；你的密钥通过 MOK 在 shim 之后生效，主板密钥库不动。依据是四份现场报告：[#162](https://github.com/physicsdolphin/nv-uefi-unlocker/issues/162)（2026-11 上旬，Secure Boot 开启、v2.1.10、RTX 30 笔记本、`ga102`，PK/KEK/db 未动）与 [#210](https://github.com/physicsdolphin/nv-uefi-unlocker/issues/210)（2026-11-08，RTX 3080 20GB + ASUS ROG Z790，官方 v2.1.10 原包 + 自加 `.sbat` + 自签 MOK，全链绿并交棒，系统内 `Confirm-SecureBootUEFI=True`、`MokListRT` 含证书、PK/KEK/db 不变），以及 [#241 追补](https://github.com/physicsdolphin/nv-uefi-unlocker/issues/241#issuecomment-6894516749)（2026-11-15，RTX 3090 桌面机，走下面的**哈希登记变体**并在活性 BitLocker 下三次受保护引导），以及 [D#287](https://github.com/physicsdolphin/nv-uefi-unlocker/discussions/287)（2026-11-22，MSI B450M-A PRO MAX + RTX 3070 `2484` 桌面机，官方 **v2.1.12-rc6** 加 `.sbat`（该版新节 VMA `0x140093000`）+ shim-signed 15.8 + **哈希登记变体**，Secure Boot 全程开启、EFI 全绿、同机 torch A/B FP16/BF16/TF32 1.76–1.77×）；#162 的脚本仓 [J0s3f/nv-unlock-secureboot-esp](https://github.com/J0s3f/nv-unlock-secureboot-esp) 可作参考实现，未 vendor 进本仓库。#210 相对 #162 的增量是**可复算的补节参数**（第 3 步）与"倒计时必须按键"这一步（第 7 步），两者都只来自 #210；#241 追补的增量是**哈希登记变体 + 活性 BitLocker/TPM 度量侧经验**（见第 7 步之后）。
 
 1. 用第 0 步生成 `MOK.key` / `MOK.crt` / `MOK.der`。
 
@@ -628,7 +647,7 @@ openssl x509 -in NVUEFI.crt -outform DER -out NVUEFI.cer
    objdump -h BOOTX64.EFI | grep -i sbat
    ```
 
-   有输出就跳到第 4 步。v2.1.10 的发布件**没有**这个节（本项目实测：`.text` / `.rdata` / `.data` / `.eh_fram` / `.reloc` 五节，无 `.sbat`）。#210 在真机上确认了后果：缺节时 shim 只回 `Verification failed: (0x1A) Security Violation`，连 MokManager 都进不去，且不说明原因。
+   有输出就跳到第 4 步。v2.1.10 的发布件**没有**这个节（本项目实测：`.text` / `.rdata` / `.data` / `.eh_fram` / `.reloc` 五节，无 `.sbat`）；**v2.1.11 同样没有**（[#281](https://github.com/physicsdolphin/nv-uefi-unlocker/issues/281) 报告者实测：同样五节、`SizeOfImage=0x72000`）；**v2.1.12-rc6 也没有**（本项目对该发布件实测：同样五节，`ImageBase=0x140000000`、`SizeOfImage=0x93000`）。#210 在真机上确认了后果：缺节时 shim 只回 `Verification failed: (0x1A) Security Violation`，连 MokManager 都进不去，且不说明原因。
 
 3. **没有就加一个**。shim ≥ 15.3 会拒绝缺少合法 `.sbat` 的第二阶段（[Arch Wiki, Secure Boot](https://wiki.archlinux.org/title/Unified_Extensible_Firmware_Interface/Secure_Boot)，[Gentoo bug 925902](https://bugs.gentoo.org/show_bug.cgi?id=925902)）；预期这条拒绝由 shim 打印，而不是由我们打印，且不会说明原因。
 
@@ -646,7 +665,7 @@ openssl x509 -in NVUEFI.crt -outform DER -out NVUEFI.cer
    objdump -h BOOTX64.grub.efi | grep -i sbat       # 必须列出 .sbat，SizeOfImage 应变大
    ```
 
-   顺序不能反：加节要针对**未签名**的 `BOOTX64.EFI`；若手上已经是签过名的文件，加完节必须重签。#210 在 v2.1.10 上实做的结果与此算法一致（`.sbat` 177 字节、节数 5→6、`SizeOfImage` `0x68000→0x69000`），可作为自查对照：三个数任一不符，说明动手的文件不是那版发布件。
+   顺序不能反：加节要针对**未签名**的 `BOOTX64.EFI`；若手上已经是签过名的文件，加完节必须重签。#210 在 v2.1.10 上实做的结果与此算法一致（`.sbat` 177 字节、节数 5→6、`SizeOfImage` `0x68000→0x69000`），可作为自查对照：三个数任一不符，说明动手的文件不是那版发布件。**v2.1.11 的对照值：新节 VMA `0x72000`**（[#281](https://github.com/physicsdolphin/nv-uefi-unlocker/issues/281) 报告者按同一算法实测；该版 `SizeOfImage=0x72000`，加节后应增大）。**v2.1.12-rc6 的对照值：新节 VMA `0x140093000`**（本项目对该发布件实测：`ImageBase=0x140000000`、末节 `.reloc` 结束 `0x92800` 对齐 `0x93000`；[D#287](https://github.com/physicsdolphin/nv-uefi-unlocker/discussions/287) 报告者按此值实做成功——objdump 显示的是含 ImageBase 的绝对 VMA，`--change-section-vma` 用同一个值）。
 
 4. **签名并验证**（产物名 `grubx64.efi`，shim 默认在自身目录找这个名字）：
 
@@ -663,7 +682,7 @@ openssl x509 -in NVUEFI.crt -outform DER -out NVUEFI.cer
 
 7. **首次引导**：shim 报 `Verification failed: (0x1A)` 属于预期（此时 MOK 还没登记），随后出现 `Press any key to perform MOK management` 的 **10 秒倒计时——必须在这个窗口里按键**。不按的话 shim 会静默继续往下走，loader 根本不会被执行，看起来就像"什么都没发生"（#210 实测）。进入 MokManager 后：Enroll key from disk → `MOK.der` → 设一次性密码 → 重启确认 Enroll。之后每次引导：shim（微软签）→ 用 MOK 验你的签名 → 启动 loader → 解锁 → 链回 `bootmgfw`，Secure Boot 全程开启。
 
-**哈希登记变体（不留任何私钥；[#241 追补](https://github.com/physicsdolphin/nv-uefi-unlocker/issues/241#issuecomment-6894516749)实测，RTX 3090 桌面机）**：不生成密钥对，MokManager 直接登记 loader 镜像本身的哈希——菜单路径是 **`Enroll hash from disk`**（不是 `Enroll key from disk`，后者要 DER 证书；选错会报 `Unsupported Format`）；该记录的 TX 镜像走的是另一条等价路：Windows 侧工具预置 `MokNew`/`MokAuth` 请求，下次 shim 引导时 MokManager 的 `Enroll MOK` 里出现待确认哈希。四个实测教训（全部来自该记录）：① MOK 登记的是 **PE/Authenticode 镜像哈希**，`Get-FileHash` 算的是整文件哈希，两者不同（PE 校验和等字段不参与镜像哈希）——**别拿文件哈希当 MOK 哈希登记**；且 EFI 里嵌了构建时间，同源码重建哈希也变，**旧登记不会授权新字节**，每次重建都要重新登记。② 首次引导未登记镜像时同样报 `0x1A`，同样要在倒计时窗口按键。③ 该机同时把**活性 BitLocker 全程保护**（XTS-AES-128、PCR 0/2/4/11 profile）走通：三次受保护引导、两次零 recovery、提升权限复查 SB/保护/PK-KEK-db-dbx 全部原样；首次设置期曾有一次明确授权的保护挂起（RebootCount=3，事后恢复并另测受保护确认航）——挂起不属常规操作，别自动延续。④ **TPM 度量侧**：同机 TCG2 日志显示 Chain-only 与 TX-skip 的差异落 PCR 4、真实 TX 与 skip（同一文件）的差异落 PCR 2/7——**不同模式=不同的度量引导序列**，skip 也可能触发 BitLocker recovery（**recovery ≠ TX 失败**），要固定一种模式用；换 shim/MokManager 版本也会改变度量，需重新接纳两条引导路径。该记录还有一份配套的机器绑定硬化构建（GPU/ROM/资产/ESP 四重钉死 + marker 从签名镜像合成不从 U 盘读），见 [community-reports](community-reports.md) 的 #241 行。
+**哈希登记变体（不留任何私钥；[#241 追补](https://github.com/physicsdolphin/nv-uefi-unlocker/issues/241#issuecomment-6894516749)实测，RTX 3090 桌面机）**：不生成密钥对，MokManager 直接登记 loader 镜像本身的哈希——菜单路径是 **`Enroll hash from disk`**（不是 `Enroll key from disk`，后者要 DER 证书；选错会报 `Unsupported Format`）；该记录的 TX 镜像走的是另一条等价路：Windows 侧工具预置 `MokNew`/`MokAuth` 请求，下次 shim 引导时 MokManager 的 `Enroll MOK` 里出现待确认哈希。四个实测教训（全部来自该记录）：① MOK 登记的是 **PE/Authenticode 镜像哈希**，`Get-FileHash` 算的是整文件哈希，两者不同（PE 校验和等字段不参与镜像哈希）——**别拿文件哈希当 MOK 哈希登记**；且 EFI 里嵌了构建时间，同源码重建哈希也变，**旧登记不会授权新字节**，每次重建都要重新登记。② 首次引导未登记镜像时同样报 `0x1A`，同样要在倒计时窗口按键。③ 该机同时把**活性 BitLocker 全程保护**（XTS-AES-128、PCR 0/2/4/11 profile）走通：三次受保护引导、两次零 recovery、提升权限复查 SB/保护/PK-KEK-db-dbx 全部原样；首次设置期曾有一次明确授权的保护挂起（RebootCount=3，事后恢复并另测受保护确认航）——挂起不属常规操作，别自动延续。④ **TPM 度量侧**：同机 TCG2 日志显示 Chain-only 与 TX-skip 的差异落 PCR 4、真实 TX 与 skip（同一文件）的差异落 PCR 2/7——**不同模式=不同的度量引导序列**，skip 也可能触发 BitLocker recovery（**recovery ≠ TX 失败**），要固定一种模式用；换 shim/MokManager 版本也会改变度量，需重新接纳两条引导路径。该记录还有一份配套的机器绑定硬化构建（GPU/ROM/资产/ESP 四重钉死 + marker 从签名镜像合成不从 U 盘读），见 [community-reports](community-reports.md) 的 #241 行。**第二份哈希登记实做（[D#287](https://github.com/physicsdolphin/nv-uefi-unlocker/discussions/287)，2026-11-22，MSI B450M-A PRO MAX + RTX 3070 `2484` 桌面机）**：官方 v2.1.12-rc6 加 `.sbat`（VMA `0x140093000`）后走 shim-signed 1.58+15.8（shim 15.8）+ `Enroll hash from disk`，Secure Boot 全程开启、EFI 全绿、桌面解锁保留（同机 torch A/B FP16 1.77×/BF16 1.76×/TF32 1.76×、FP32 平）。代价观测：**该解锁引导下 Windows Hello PIN 不可用（疑 PCR7 随 shim 链变化），密码登录正常**——这不是 TX 失败，重设 PIN 前先确认自己走的是哪条引导路径。
 
 内置 ESP 变体（**本项目不推荐；现有两份现场记录，都属于用户自担风险的偏离**）：把四个文件放进内置 ESP，免掉每次插 U 盘。变体 1（#162 报告者）：文件放 `\EFI\BOOT\`、排在 BootOrder 首位——loader 在 CHAIN-BOOT 里会跳过自己的 `Boot####` 与同一 ESP 上的 Windows 项，不循环。变体 2（[bailu974 的记录](https://github.com/bailu974/nv-uefi-unlocker-on-SecureBoot)，2026-11-09）：那块 Insyde 固件**拒绝新建 `BootXXXX`**（`SetFirmwareEnvironmentVariableEx` 回 `err=87`，但改写已有项放行），于是改写 `Boot0000`（Windows Boot Manager 项）指向 `\EFI\nvunlock\BOOTX64.EFI`，并把原始项备份到 `Boot2001` 兜底；资产摊在 ESP 根（loader 只从自己所在卷的根读资产，不看子目录，84 MB 需 ESP 有余量）。共同代价：README 的明确建议是「[不要复制到系统 ESP](../README.md)」，改 `Boot0000`/改 ESP 都可能让机器起不来——动手前先备份、确认能进 BIOS 恢复；两份记录的作者都自报了备份与回滚脚本。
 
@@ -702,7 +721,7 @@ ACE 系（腾讯）用的是内核驱动 + 服务端策略，它可能同时看�
 | 生效时窗 | 用户手动从 U 盘进 → 跑事务 | `ReadyToBoot` 回调，与 U 盘同窗口（`bootmgfw` 之前），每次引导自动重放 |
 | TPM / BitLocker | `db` 改动影响 PCR[7]（若 profile 含 [7]）；自签链改变被加载镜像的度量 | 改固件 → **PCR[1] 变**；BitLocker profile 含 [1] 时无法解封，会要求恢复密钥；刷前必须先挂起 |
 | 不刷写的验证捷径 | — | UEFI Shell 里 `load fs0:\NvUnlockDxe.efi`，可先验形态再决定是否刷写 |
-| 证据 | 路线 B 三台机（含两台台式机全流程，`.sbat` 参数与倒计时按键均已实做；#241 追补为哈希登记变体+活性 BitLocker）；路线 A 二手 | 仅[可行性文档](dxe-driver-ffs-feasibility.md)，**未实机验证** |
+| 证据 | 路线 B 四台机（含三台台式机全流程，`.sbat` 参数与倒计时按键均已实做；#241 追补为哈希登记变体+活性 BitLocker，D#287 为 rc6 + 哈希登记第二例）；路线 A 二手 | 仅[可行性文档](dxe-driver-ffs-feasibility.md)，**未实机验证** |
 
 一句话：**两条路都改变了某个度量**——自签动的是引导链（PCR[4]/[7] 侧），FFS 动的是固件（PCR[1] 侧）。对「只查 SB 状态位」的客户端，两条都可能有效；对「要求出厂引导链或出厂固件度量」的客户端，两条都不保证。反作弊的判定规则是厂商侧策略，会随时调整，本文不做任何「能过/不能过」的承诺。
 
@@ -710,8 +729,8 @@ ACE 系（腾讯）用的是内核驱动 + 服务端策略，它可能同时看�
 
 | 项目 | 证据 | 状态 |
 | --- | --- | --- |
-| 路线 B（MOK + shim） | #162 笔记本报告（解锁存活到 Windows）；**#210 台式机全流程**：SB 开启、v2.1.10 + `.sbat` + 自签 MOK，全链绿 + `Confirm-SecureBootUEFI=True` + `MokListRT` 含证书 + PK/KEK/db 不变；**#241 追补台式机全流程（哈希登记变体，无私钥）**：SB 开启 + 活性 BitLocker（PCR 0/2/4/11）、shim 15.8 钉 hash、三次受保护引导（两次零 recovery）、提升权限复查全绿、TCG2 度量分析（TX vs skip 差 PCR 2/7，Chain-only vs skip 差 PCR 4） | 三台机（两台台式机全流程）；第 3/4/7 步按 #210 实做参数写死，本项目未在自有硬件上复跑 |
-| 发布件缺 `.sbat` | 本项目核对 v2.1.10 产物节表；#210 真机确认缺节时 shim 只回 `0x1A` | 已验证（产物层 + 一台真机） |
+| 路线 B（MOK + shim） | #162 笔记本报告（解锁存活到 Windows）；**#210 台式机全流程**：SB 开启、v2.1.10 + `.sbat` + 自签 MOK，全链绿 + `Confirm-SecureBootUEFI=True` + `MokListRT` 含证书 + PK/KEK/db 不变；**#241 追补台式机全流程（哈希登记变体，无私钥）**：SB 开启 + 活性 BitLocker（PCR 0/2/4/11）、shim 15.8 钉 hash、三次受保护引导（两次零 recovery）、提升权限复查全绿、TCG2 度量分析（TX vs skip 差 PCR 2/7，Chain-only vs skip 差 PCR 4）；**D#287 台式机全流程（rc6 + 哈希登记）**：SB 全程开启、EFI 全绿、FP16/BF16/TF32 1.76–1.77×、FP32 平 | 四台机（三台台式机全流程）；第 3/4/7 步按 #210 实做参数写死，本项目未在自有硬件上复跑 |
+| 发布件缺 `.sbat` | 本项目核对 v2.1.10 / v2.1.12-rc6 产物节表；#210 真机确认缺节时 shim 只回 `0x1A`；D#287 在 rc6 上按 `0x140093000` 补节后通过 | 已验证（产物层 + 真机） |
 | 第 0 步的 `openssl` 命令 | 本项目执行（OpenSSL 4.0.3） | 已验证 |
 | 路线 A（db 自签） | 二手反馈，无日志、无主板型号 | 未复现、未执行 |
 | Secure Boot 开启 + `ssdiag` | `tools/ssdiag/README.md`：expected to be refused；#210 据此选择不加载 | 未实测（#210 明确标 not verified） |
