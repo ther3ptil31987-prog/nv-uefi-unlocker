@@ -1117,7 +1117,14 @@ pub fn run_transaction(
     // removed; this window matches the Ampere chain's own FLR discipline.
     // On false the chain aborts: the card is freshly reset and nothing
     // unlocked, so no unwinding is due.
-    if !crate::revive::sbr_gpu_in_transaction(gpu, &claim.baseline) {
+    // 2026-11-24 rebar merge: SKIPPED when the rebar pair already landed
+    // this boot (\tx-rebar-then-tx.txt flow) - a second SBR re-latches
+    // ReBAR config away from the written pair (field-proven: BAR1 config
+    // re-wound to the 8G-aligned default mid-transaction, killing the BAR
+    // at handoff) and Turing's chain needs no reset anyway (FLR skipped).
+    if crate::tx::probe_file("\\tx-rebar-then-tx.txt") {
+        info!("TX-tu10x: in-transaction SBR SKIPPED (\\tx-rebar-then-tx.txt: the rebar pair already landed this boot; a second SBR re-latches ReBAR config and kills the BAR)");
+    } else if !crate::revive::sbr_gpu_in_transaction(gpu, &claim.baseline) {
         return Err(TxError::EIO);
     }
 
@@ -1867,14 +1874,14 @@ pub fn run_transaction(
     // being worse than none is the design axiom here.
     // `\tx-reconnect-legacy.txt` restores the old reconnect_all path
     // (recursive + PR#13 non-recursive logic) as an escape hatch;
-    // `\tu10x-no-reconnect.txt` keeps its experimental skip for Turing.
+    // `\tx-no-reconnect.txt` keeps its experimental skip for Turing.
     // Issue #261: if the target owned no GOP child at detach, the console
     // lived on another GPU (hybrid display) or nowhere - there is nothing
     // to rebuild, and loading the card's ROM GOP driver in that state just
     // returns SUCCESS without publishing a child. Skip the ~2 s attempt
     // and say so, instead of reporting a rebuild "failure".
-    if family_is_turing(assets.family) && crate::tx::probe_file("\\tu10x-no-reconnect.txt") {
-        info!("TX-tu10x: reconnect skipped (tu10x-no-reconnect marker)");
+    if family_is_turing(assets.family) && crate::tx::probe_file("\\tx-no-reconnect.txt") {
+        info!("TX-tu10x: reconnect skipped (tx-no-reconnect marker)");
     } else if crate::tx::probe_file("\\tx-reconnect-legacy.txt") {
         info!("TX: \\tx-reconnect-legacy.txt present - legacy reconnect path (recursive + PR#13 logic)");
         crate::tx_detach::reconnect_all(pci_handle);
@@ -2101,8 +2108,8 @@ fn agitate_stages(
     // Console rebuild parity: the exact block from run_transaction
     // (default native-GOP rebuild from the card's own shadowed ROM; the
     // legacy reconnect and the Turing skip keep their markers).
-    if family_is_turing(assets.family) && crate::tx::probe_file("\\tu10x-no-reconnect.txt") {
-        info!("TX-tu10x: reconnect skipped (tu10x-no-reconnect marker)");
+    if family_is_turing(assets.family) && crate::tx::probe_file("\\tx-no-reconnect.txt") {
+        info!("TX-tu10x: reconnect skipped (tx-no-reconnect marker)");
     } else if crate::tx::probe_file("\\tx-reconnect-legacy.txt") {
         info!("TX-AGITATE: \\tx-reconnect-legacy.txt present - legacy reconnect path (recursive + PR#13 logic)");
         crate::tx_detach::reconnect_all(pci_handle);
@@ -2207,6 +2214,215 @@ pub fn flr_once(pci: &crate::pci::PciIo) {
         sta & 0x200 != 0,
     );
     pm_flr_post(pci, pm);
+}
+
+/// \tx-rebar-read.txt rung 0 (2026-11-24 bench line): read-only rebar-face
+/// probe at the EFI stage. Config-space reads first - PORT-DIAG reads config
+/// with firmware drivers bound on every boot, proven safe. The XVE MMIO
+/// mirrors go second, one access per log line: the 2026-11-22 pre-transaction
+/// SBR soft-lock taught "nothing touches the card while firmware drivers are
+/// bound", and the first \tx-rebar.txt run (size_idx 13 and 10 alike) hung
+/// right at what this probe will isolate - the first XVE-page access. If the
+/// MMIO reads hang, the config values are already in the log and the answer
+/// (XVE page inaccessible at EFI while firmware-bound) is delivered.
+pub fn probe_rebar_reads(pci: &crate::pci::PciIo, gpu: &TxGpu) {
+    info!("REBAR-READ: config side first (proven at EFI by PORT-DIAG)");
+    for (off, name) in
+        [(0x88u32, "LnkCtl/LnkSta"), (0x610, "FB override"), (0xbbc, "BAR1 cap mask"), (0xbc0, "BAR1 control")]
+    {
+        info!("REBAR-READ: cfg {off:#04x} ({name}) = {:#010x}", pci.config_read_u32(off));
+    }
+    info!("REBAR-READ: config done - now XVE MMIO mirrors, EXPERIMENTAL (firmware-bound state, the 11-22 soft-lock class; hang here = the answer)");
+    for (off, name) in
+        [(0x0008_8088u32, "LnkCtl/LnkSta"), (0x0008_8610, "FB override"), (0x0008_8bbc, "BAR1 cap"), (0x0008_8bc0, "BAR1 ctl")]
+    {
+        let v = pci.bar_read_u32(gpu.bar, off as u64);
+        info!("REBAR-READ: mmio {off:#08x} ({name}) = {v:#010x}");
+    }
+    info!("REBAR-READ: complete - every access survived");
+}
+
+/// \tx-rebar rung 1/2 pair - MMIO route (2026-11-24 bench line): the
+/// GA102 FB-size override (config 0x610 = BAR0 0x88610 through the XVE PRI
+/// page; mask 0xF80 value 0xC80 - proven on TU106, one write opens the
+/// ReBAR advertisement from 3 sizes to 10) then the ReBAR control (config
+/// 0xBC0 = BAR0 0x88bc0) selecting the BAR1 size. The PciIo config route is
+/// OUT on this firmware (extended offsets >0x100 answer UNSUPPORTED - the
+/// rung-2 round proved it fail-closed), so the pair goes through the XVE
+/// mirror - and the caller gates it behind claim(+SBR): the disciplined
+/// window where BAR0 MMIO is proven alive (the SBR sanity read) and the
+/// 11-22 "never touch the card while firmware drivers are bound" discipline
+/// is satisfied. Read-back after every write (constitution #1); the value is
+/// logged BEFORE each write (a hang leaves the pre-state in the log). NO
+/// reset / NO FLR may follow: the pair must survive into Windows' boot
+/// enumeration.
+pub fn run_rebar_mmio(gpu: &TxGpu, size_idx: u32, adv_field: u32) -> Result<(), TxError> {
+    const FB_OFF: u32 = 0x0008_8610;
+    const CAP_OFF: u32 = 0x0008_8bbc;
+    const CTL_OFF: u32 = 0x0008_8bc0;
+    const FB_MASK: u32 = 0x0000_0f80;
+    const SZ_MASK: u32 = 0x0000_3f00;
+    let fb_val = 0x0000_0800 | (adv_field << 7); // bit11=enable, bits[10:7]=field
+
+    info!(
+        "REBAR: BEGIN (MMIO-mirror pair via XVE, readback each; advertise field {adv_field} (top size_idx {}), select size_idx {size_idx} = {} MiB aperture)",
+        adv_field as i32 - 2,
+        1u32 << size_idx
+    );
+    let old_fb = gpu.read32(FB_OFF)?;
+    info!("REBAR: mmio 0x88610 read {old_fb:#010x} (pre-write)");
+    let new_fb = (old_fb & !FB_MASK) | fb_val;
+    gpu.write32(FB_OFF, new_fb);
+    let rb_fb = gpu.read32(FB_OFF)?;
+    let fb_ok = rb_fb == new_fb;
+    info!("REBAR: mmio 0x88610 wrote {new_fb:#010x} -> readback {rb_fb:#010x} {}", if fb_ok { "OK" } else { "MISMATCH" });
+    if !fb_ok {
+        return Err(TxError::EIO);
+    }
+
+    let mask = gpu.read32(CAP_OFF)?;
+    info!("REBAR: mmio 0x88bbc BAR1 supported mask {mask:#010x} ({} sizes advertised)", mask.count_ones());
+
+    let old_ctl = gpu.read32(CTL_OFF)?;
+    info!("REBAR: mmio 0x88bc0 read {old_ctl:#010x} (pre-write)");
+    let new_ctl = (old_ctl & !SZ_MASK) | (size_idx << 8);
+    gpu.write32(CTL_OFF, new_ctl);
+    let rb_ctl = gpu.read32(CTL_OFF)?;
+    let ctl_ok = rb_ctl == new_ctl;
+    info!("REBAR: mmio 0x88bc0 wrote {new_ctl:#010x} (BAR1, size_idx {size_idx}) -> readback {rb_ctl:#010x} {}", if ctl_ok { "OK" } else { "MISMATCH" });
+    if !ctl_ok {
+        return Err(TxError::EIO);
+    }
+
+    let mask2 = gpu.read32(CAP_OFF)?;
+    info!("REBAR: FINAL mask {mask:#010x} -> {mask2:#010x}, ctl {rb_ctl:#010x} - live override+selection handed to Windows boot enumeration");
+    Ok(())
+}
+
+/// \tx-rebar rung with \\tx-rebar-ecam.txt - ECAM-direct route: the same
+/// config registers through the memory-mapped ECAM region (MCFG, found by
+/// walking RSDP->XSDT), bypassing BOTH the PciIo extended-config refusal and
+/// the XVE MMIO page. Boot services are identity-mapped, so the ECAM
+/// physical address is directly readable once located. NV_30_DXE's native
+/// route is config space; this is that route without the PciIo filter.
+/// Every access logged before the next; hang leaves the trail in the log.
+pub fn run_rebar_ecam(loc: (usize, usize, usize, usize), size_idx: u32) -> Result<(), TxError> {
+    use uefi::table::cfg::ConfigTableEntry;
+    const FB_MASK: u32 = 0x0000_0f80;
+    const FB_VAL: u32 = 0x0000_0c80;
+    const SZ_MASK: u32 = 0x0000_3f00;
+
+    info!("REBAR-ECAM: BEGIN (ECAM-direct config pair; size_idx {size_idx})");
+    let mut rsdp: Option<u64> = None;
+    uefi::system::with_config_table(|entries| {
+        for entry in entries {
+            if entry.guid == ConfigTableEntry::ACPI2_GUID {
+                rsdp = Some(entry.address as u64);
+            }
+        }
+    });
+    let Some(rsdp) = rsdp else {
+        info!("REBAR-ECAM: no ACPI2.0 config-table entry - no RSDP, route unavailable");
+        return Err(TxError::ENodev);
+    };
+    info!("REBAR-ECAM: RSDP at {rsdp:#x}");
+    // RSDP v2: +28 XSDT address (u64).
+    let xsdt = unsafe { core::ptr::read_volatile((rsdp + 24) as *const u64) };
+    info!("REBAR-ECAM: XSDT at {xsdt:#x}");
+    // XSDT header: +4 length (u32), entries are u64 table pointers from +0x24.
+    let xsdt_len = unsafe { core::ptr::read_volatile((xsdt + 4) as *const u32) } as usize;
+    let mut mcfg: Option<u64> = None;
+    for i in 0..(xsdt_len.saturating_sub(36) / 8) {
+        let tbl = unsafe { core::ptr::read_volatile((xsdt + 36 + (i as u64) * 8) as *const u64) };
+        if tbl == 0 || tbl < 0x1000 {
+            continue;
+        }
+        let sig = unsafe { core::ptr::read_volatile(tbl as *const [u8; 4]) };
+        if &sig == b"MCFG" {
+            mcfg = Some(tbl);
+            info!("REBAR-ECAM: MCFG found at {tbl:#x}");
+            break;
+        }
+    }
+    let Some(mcfg) = mcfg else {
+        info!("REBAR-ECAM: no MCFG table in XSDT - route unavailable");
+        return Err(TxError::ENodev);
+    };
+    // MCFG: +0x44 u64 = ECAM base.
+    let ecam = unsafe { core::ptr::read_volatile((mcfg + 0x44) as *const u64) };
+    info!("REBAR-ECAM: ECAM base {ecam:#x}");
+    let (seg, bus, dev, fun) = loc;
+    if seg != 0 {
+        info!("REBAR-ECAM: segment {seg} != 0 - single-segment MCFG assumption broken, route unavailable");
+        return Err(TxError::ENodev);
+    }
+    let dev_base = ecam + ((bus as u64) << 20) + ((dev as u64) << 15) + ((fun as u64) << 12);
+    info!("REBAR-ECAM: device config at {dev_base:#x} (bus {bus} dev {dev} fn {fun})");
+    let rd = |off: u32| unsafe { core::ptr::read_volatile((dev_base + off as u64) as *const u32) };
+    let wr = |off: u32, v: u32| unsafe { core::ptr::write_volatile((dev_base + off as u64) as *mut u32, v) };
+
+    let old_fb = rd(0x610);
+    info!("REBAR-ECAM: cfg 0x610 read {old_fb:#010x} (pre-write)");
+    let new_fb = (old_fb & !FB_MASK) | FB_VAL;
+    wr(0x610, new_fb);
+    let rb_fb = rd(0x610);
+    let fb_ok = rb_fb == new_fb;
+    info!("REBAR-ECAM: cfg 0x610 wrote {new_fb:#010x} -> readback {rb_fb:#010x} {}", if fb_ok { "OK" } else { "MISMATCH" });
+    if !fb_ok {
+        return Err(TxError::EIO);
+    }
+    let mask = rd(0xbbc);
+    info!("REBAR-ECAM: cfg 0xbbc BAR1 supported mask {mask:#010x} ({} sizes)", mask.count_ones());
+    let old_ctl = rd(0xbc0);
+    info!("REBAR-ECAM: cfg 0xbc0 read {old_ctl:#010x} (pre-write)");
+    let new_ctl = (old_ctl & !SZ_MASK) | (size_idx << 8);
+    wr(0xbc0, new_ctl);
+    let rb_ctl = rd(0xbc0);
+    let ctl_ok = rb_ctl == new_ctl;
+    info!("REBAR-ECAM: cfg 0xbc0 wrote {new_ctl:#010x} (BAR1, size_idx {size_idx}) -> readback {rb_ctl:#010x} {}", if ctl_ok { "OK" } else { "MISMATCH" });
+    if !ctl_ok {
+        return Err(TxError::EIO);
+    }
+    let mask2 = rd(0xbbc);
+    info!("REBAR-ECAM: FINAL mask {mask:#010x} -> {mask2:#010x}, ctl {rb_ctl:#010x}");
+    Ok(())
+}
+
+/// \tx-rebar-scan.txt (2026-11-24 bench question: "can the advertisement go
+/// past 32G? 4090-48G wants >=64G"): map the 0x610 FB-override field encoding
+/// and probe whether the ReBAR supported-mask register itself is host
+/// writable, both inside the claim(+SBR) window. The field at bits[10:7] is
+/// 4 bits wide; value 9 (=0xC80) is the NV_30_DXE constant that opens 10
+/// sizes topping at idx15=32G. Values 0..15 swept with the mask read after
+/// each - if any value opens bits >=20 (64G+), the advertisement extends.
+/// The cap-mirror (0x88bbc) has only ever been read - one write probe tells
+/// whether the advertisement is directly host-controllable (in which case
+/// the size ceiling is the cap format's bit23=512G, not the field's).
+/// Read-only wrt the BAR assignment; everything washes at the next reset.
+pub fn run_rebar_fieldscan(gpu: &TxGpu) {
+    info!("REBAR-SCAN: 0x610 field[10:7] sweep (bit11=enable), mask read after each value");
+    for v in 0..16u32 {
+        let val = 0x800 | (v << 7);
+        gpu.write32(0x0008_8610, val);
+        let fb = gpu.read32(0x0008_8610).unwrap_or(0xffff_ffff);
+        let mask = gpu.read32(0x0008_8bbc).unwrap_or(0xffff_ffff);
+        let max_idx = 31i32 - mask.leading_zeros() as i32 - 4;
+        info!(
+            "REBAR-SCAN: field {v:2} -> 0x88610 {fb:#010x}, mask {mask:#010x} ({} sizes, top size_idx {max_idx})",
+            mask.count_ones()
+        );
+    }
+    let m0 = gpu.read32(0x0008_8bbc).unwrap_or(0xffff_ffff);
+    gpu.write32(0x0008_8bbc, m0 | 0x0030_0000);
+    let m1 = gpu.read32(0x0008_8bbc).unwrap_or(0xffff_ffff);
+    info!(
+        "REBAR-SCAN: cap-mirror write probe {m0:#010x} -> |0x300000 (bits 20/21 = 64G/128G) -> readback {m1:#010x} {}",
+        if m1 == m0 | 0x0030_0000 { "WRITABLE - advertisement is host-controllable" } else { "read-only (dropped)" }
+    );
+    gpu.write32(0x0008_8610, 0x0000_0c80);
+    let fb = gpu.read32(0x0008_8610).unwrap_or(0xffff_ffff);
+    let mask = gpu.read32(0x0008_8bbc).unwrap_or(0xffff_ffff);
+    info!("REBAR-SCAN: restored 0x88610=0xc80 (readback {fb:#010x}), final mask {mask:#010x}");
 }
 
 /// Last observable state before the chain-load, in one line. Everything the

@@ -1,4 +1,13 @@
-//! ssdiag v0.8.9 - in-OS NVIDIA register diagnosis + separate-lock re-apply.
+//! ssdiag v0.8.12 - in-OS NVIDIA register diagnosis + separate-lock re-apply.
+//! v0.8.12 adds --bar1-scan (READ-ONLY): config control 0xBC0 (the hardware
+//! aperture the device decodes) + a 0xff-saturation boundary scan across the
+//! BAR1 aperture (16 dwords at 15 offsets, 256 MiB..31 GiB, through mapped
+//! windows) - measures the REAL usable BAR1 vs what the driver believes,
+//! for loader-side ReBAR writes followed by hibernate resumes.
+//! v0.8.11: --read-offset accepts range form A-B (inclusive, word step,
+//! cap 512) and printed reads are sorted+deduped.
+//! v0.8.10 adds --read-offset A (READ-ONLY probe, repeatable): read BAR0
+//! offset A and print - the arbitrary-read counterpart of --target-offset.
 //! v0.8.9 adds --target-offset A --value V (ARBITRARY WRITE MODE, repeatable
 //! ordered pairs): raw BAR0 writes through the same pmxdrv transport the
 //! diagnostics use, each followed by a read-back print. Lands regardless of
@@ -2491,10 +2500,15 @@ fn verify_embedded_hash() -> Result<(), String> {
 
 /// Extract + service-create + start. Service name is OURS (SSDIAG_PMXDRV) so
 /// cleanup never touches a driver another tool deployed.
+///
+/// The extraction target carries the process id (2026-11-24: two ssdiag
+/// processes racing one fixed Temp path made the loser fail with os error 32
+/// while the winner's service held the file; a per-pid name lets concurrent
+/// invocations coexist and each cleanup remove only its own copy).
 fn deploy_driver() -> Result<(), String> {
     verify_embedded_hash()?;
 
-    let sys_path = std::env::temp_dir().join(TEMP_SYS);
+    let sys_path = std::env::temp_dir().join(format!("ssdiag-pmxdrv-{}.sys", std::process::id()));
     std::fs::write(&sys_path, PMXDRV_SYS)
         .map_err(|e| format!("extract to {} failed: {e}", sys_path.display()))?;
     let readback = std::fs::read(&sys_path).map_err(|e| format!("re-read failed: {e}"))?;
@@ -2658,7 +2672,7 @@ fn cleanup_driver() {
         }
         win::CloseServiceHandle(mgr);
     }
-    let sys_path = std::env::temp_dir().join(TEMP_SYS);
+    let sys_path = std::env::temp_dir().join(format!("ssdiag-pmxdrv-{}.sys", std::process::id()));
     // 50 ms grain over the same 2 s worst-case budget - the kernel releases
     // the image mapping with a small delay after the stop, and the coarse
     // 200 ms steps used to pay that delay in multiples
@@ -2668,6 +2682,9 @@ fn cleanup_driver() {
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
+    // Best-effort sweep of the legacy fixed name (pre-0.8.14 builds left it
+    // behind when a racing invocation died before cleanup).
+    let _ = std::fs::remove_file(std::env::temp_dir().join(TEMP_SYS));
 }
 
 fn ensure_driver() -> Result<PmxDrv, String> {
@@ -3273,6 +3290,183 @@ fn mcfg_base_for(bus: u32) -> Option<u64> {
 }
 
 /// Read-only ReBAR extended-capability probe through ECAM. The driver only
+/// \--bar1-scan (v0.8.12, 2026-11-24 rebar bench line): measure the REAL
+/// usable BAR1 - the question "does the hardware aperture match what the
+/// driver believes" after loader-side ReBAR writes and hibernate resumes.
+/// Three read-only probes through the existing ECAM page + per-offset
+/// physical maps:
+///   1. config control 0xBC0 -> the hardware-selected aperture (the truth
+///      the device decodes), vs the driver's belief (nvidia-smi/GPU-Z);
+///   2. config 0x610 override -> whether the vendor advertise bits are
+///      still set or were cleared by driver init (the #211 end-state);
+///   3. aperture boundary scan: read 16 dwords at 15 offsets from 256 MiB
+///      to 31 GiB through mapped BAR1 windows - decoded VRAM reads back
+///      actual content, reads beyond the decode come back as master-abort
+///      0xffffffff on desktop x86; the 0xff-saturation point marks the real
+///      decode end. Read-only: never writes VRAM, so a resumed/live driver
+///      cannot be disturbed.
+/// \--bar1-scan-write (v0.8.13, 2026-11-24): the write-differentiate probe,
+/// LIVE-GPU version (no device disable). Four sample points spread across
+/// the aperture (+1G/+8G/+16G/+31G, each 0x800 into a 4 KiB page - page
+/// middles are data/filler territory, descriptor/page-table allocations
+/// prefer page starts). Per point: read original -> write ~original ->
+/// read back -> restore original -> confirm. Single dword in flight, tens
+/// of microseconds between the two reads of each point; the driver is
+/// never stalled. Decode+write discrimination: points decode if the flip
+/// sticks; points are INDEPENDENT storage if flipped values differ across
+/// points (an aliased aperture shows the same storage at truncated
+/// addresses, so cross-point value comparison after independent flips is
+/// the verdict). Corrupts at most 8 bytes of driver-managed VRAM for
+/// microseconds (restore-verified); a TDR during the window is the same
+/// recovery as any GPU fault (disable-enable / reboot).
+fn bar1_scan_write(drv: &PmxDrv, instance: &str, bdf: Option<(u32, u32, u32)>) {
+    let Some(did) = dev_id_from(instance) else {
+        println!("BAR1-SCAN-W: no DEV_ in DeviceID - skipped");
+        return;
+    };
+    let Some((bus, dev, func)) = bdf else {
+        println!("BAR1-SCAN-W: bdf not derivable - skipped");
+        return;
+    };
+    let Some(mcfg) = mcfg_base_for(bus) else {
+        println!("BAR1-SCAN-W: no MCFG/MMCONFIG for bus {bus} - skipped");
+        return;
+    };
+    let ecam = mcfg + ((bus as u64) << 20) + ((dev as u64) << 15) + ((func as u64) << 12);
+    let va = match drv.map_physical(ecam, 1) {
+        Ok(va) => va,
+        Err(e) => {
+            println!("BAR1-SCAN-W: ECAM map failed ({e}) - skipped");
+            return;
+        }
+    };
+    let base = va as *const u8;
+    let rd = |off: u32| unsafe { (base.add(off as usize) as *const u32).read_volatile() };
+    let idword = rd(0);
+    if (idword & 0xffff) != 0x10de || ((idword >> 16) & 0xffff) != did as u32 {
+        println!("BAR1-SCAN-W: ECAM page mismatch - skipped");
+        drv.unmap_physical(va);
+        return;
+    }
+    let lo = rd(0x14);
+    let hi = rd(0x18);
+    let ctl = rd(0xbc0);
+    let idx = (ctl >> 8) & 0x3f;
+    drv.unmap_physical(va);
+    let bar1 = (((hi as u64) << 32) | (lo as u64 & 0xffff_fff0)) & !0xf;
+    println!("BAR1-SCAN-W: BAR1 base {bar1:#x}, aperture {} MiB (size_idx {idx}) - LIVE-GPU write-differentiate, 4 points x (read/flip/readback/restore/confirm)", 1u64 << idx);
+    let points_mib: [u64; 4] = [1024, 8192, 16384, 31744];
+    let mut flipped: Vec<(u64, u32)> = Vec::new();
+    for &mib in &points_mib {
+        let probe_pa = bar1 + (mib << 20) + 0x800;
+        let Ok(pva) = drv.map_physical(probe_pa, 1) else {
+            println!("BAR1-SCAN-W: +{mib:5} MiB: map failed");
+            continue;
+        };
+        let p = pva as *mut u32;
+        let orig = unsafe { p.read_volatile() };
+        let flip = !orig;
+        unsafe { p.write_volatile(flip) };
+        let rb = unsafe { p.read_volatile() };
+        unsafe { p.write_volatile(orig) };
+        let back = unsafe { p.read_volatile() };
+        drv.unmap_physical(pva);
+        let stuck = rb == flip;
+        let restored = back == orig;
+        println!(
+            "BAR1-SCAN-W: +{mib:5} MiB: orig {orig:#010x} -> flip {flip:#010x} -> rb {rb:#010x} -> restore {back:#010x} {} {}",
+            if stuck { "[flip STUCK = decode+write]" } else { "[flip lost = abort/RO/aliased-to-ro]" },
+            if restored { "[restore OK]" } else { "[RESTORE FAILED - 4 bytes altered]" }
+        );
+        if stuck {
+            flipped.push((mib, flip));
+        }
+    }
+    if flipped.len() >= 2 {
+        let distinct = flipped.iter().map(|(_, v)| *v).collect::<std::collections::BTreeSet<_>>().len();
+        println!(
+            "BAR1-SCAN-W: verdict: {}/4 points decode+write; {} distinct flipped values across points -> {}",
+            flipped.len(),
+            distinct,
+            if distinct == flipped.len() { "INDEPENDENT storage per point - real decoded aperture (no aliasing)" } else { "SHARED storage - aliased window (truncated addresses)" }
+        );
+    } else {
+        println!("BAR1-SCAN-W: verdict: fewer than 2 points accepted the flip - cannot discriminate aliasing; the aperture may be RO-mapped by the driver (BAR1 as write-combined display surface) or entirely windowed");
+    }
+}
+
+fn bar1_scan_probe(drv: &PmxDrv, instance: &str, bdf: Option<(u32, u32, u32)>) {
+    let Some(did) = dev_id_from(instance) else {
+        println!("BAR1-SCAN: no DEV_ in DeviceID - skipped");
+        return;
+    };
+    let Some((bus, dev, func)) = bdf else {
+        println!("BAR1-SCAN: bdf not derivable - skipped");
+        return;
+    };
+    let Some(mcfg) = mcfg_base_for(bus) else {
+        println!("BAR1-SCAN: no MCFG/MMCONFIG for bus {bus} - skipped");
+        return;
+    };
+    let ecam = mcfg + ((bus as u64) << 20) + ((dev as u64) << 15) + ((func as u64) << 12);
+    let va = match drv.map_physical(ecam, 1) {
+        Ok(va) => va,
+        Err(e) => {
+            println!("BAR1-SCAN: ECAM map failed ({e}) - skipped");
+            return;
+        }
+    };
+    let base = va as *const u8;
+    let rd = |off: u32| unsafe { (base.add(off as usize) as *const u32).read_volatile() };
+    let idword = rd(0);
+    let (vid, cdid) = (idword & 0xffff, (idword >> 16) & 0xffff);
+    if vid != 0x10de || cdid != did as u32 {
+        println!("BAR1-SCAN: ECAM page reads {vid:04x}:{cdid:04x}, expected 10de:{did:04X} - skipped");
+        drv.unmap_physical(va);
+        return;
+    }
+    let ctl = rd(0xbc0);
+    let idx = (ctl >> 8) & 0x3f;
+    println!(
+        "BAR1-SCAN: config control 0xbc0 = {ctl:#010x} -> hardware aperture {} MiB (size_idx {idx})",
+        1u32 << idx
+    );
+    println!("BAR1-SCAN: config 0x610 override = {:#010x} (cleared by driver init if not 0x?c80)", rd(0x610));
+    let lo = rd(0x14);
+    let hi = rd(0x18);
+    drv.unmap_physical(va);
+    let bar1 = (((hi as u64) << 32) | (lo as u64 & 0xffff_fff0)) & !0xf;
+    println!("BAR1-SCAN: BAR1 base = {bar1:#x} (cfg 0x14={lo:#010x} 0x18={hi:#010x})");
+    if bar1 == 0 {
+        println!("BAR1-SCAN: BAR1 unassigned - boundary scan skipped");
+        return;
+    }
+    println!("BAR1-SCAN: aperture boundary scan (16 dwords per offset; all-ff = beyond decode):");
+    let offs_mib: [u64; 15] = [256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192, 12288, 16384, 24576, 31744];
+    let aperture_mib = 1u64 << idx;
+    println!("BAR1-SCAN: content samples below are NON-AUTHORITATIVE for decode: all-ff may be unwritten VRAM (ff content), and reads beyond the aperture may alias (address bits truncated, aperture repeats) or return non-ff abort data. The control 0xbc0 readback above is the authoritative aperture.");
+    for &mib in &offs_mib {
+        let probe_pa = bar1 + (mib << 20);
+        let Ok(pva) = drv.map_physical(probe_pa, 1) else {
+            println!("BAR1-SCAN: +{mib:5} MiB: map failed");
+            continue;
+        };
+        let p = pva as *const u32;
+        let mut ff = 0usize;
+        for i in 0..16 {
+            if unsafe { p.add(i).read_volatile() } == 0xffff_ffff {
+                ff += 1;
+            }
+        }
+        drv.unmap_physical(pva);
+        let in_aperture = mib < aperture_mib;
+        let zone = if in_aperture { "inside" } else { "beyond" };
+        let verdict = if ff == 16 { "content=ff (unwritten VRAM or undecoded - ambiguous)" } else if ff == 0 { "content non-ff (aliasing/abort data possible beyond aperture - not decode proof)" } else { "mixed content" };
+        println!("BAR1-SCAN: +{mib:5} MiB [{zone}]: {verdict} ({ff}/16 ff)");
+    }
+    println!("BAR1-SCAN: authoritative aperture = the control 0xbc0 readback above; content samples are informational only (field-proven: +384 MiB inside a 512 MiB aperture read all-ff while +31 GiB beyond it read non-ff)");
+}
+
 /// offers physical map/unmap, and config space on every modern x64 machine
 /// IS memory-mapped (MCFG/ECAM), so the probe needs no new driver surface:
 /// it maps exactly one 4 KiB page - the target function's own config space
@@ -5345,8 +5539,11 @@ fn validate_prom_bit_flags(prom_bit: bool, reapply: bool, fuserows: bool, has_po
 fn run() -> i32 {
     let mut reapply = false;
     let mut prom_bit = false;
+    let mut bar1_scan = false;
+    let mut bar1_scan_write_flag = false;
     let mut pokes: Vec<(u32, u32)> = Vec::new();
     let mut poke_off: Option<u32> = None;
+    let mut read_offsets: Vec<u32> = Vec::new();
     let mut dry = false;
     let mut inv_only = false;
     let mut sb_arm = false;
@@ -5362,6 +5559,8 @@ fn run() -> i32 {
         match a.as_str() {
             "--reapply" => reapply = true,
             "--prom-bit" => prom_bit = true,
+            "--bar1-scan" => bar1_scan = true,
+            "--bar1-scan-write" => bar1_scan_write_flag = true,
             "--target-offset" => {
                 let v = args.next().unwrap_or_else(|| {
                     eprintln!("--target-offset requires a hex BAR0 offset, e.g. --target-offset 0x409664");
@@ -5392,6 +5591,43 @@ fn run() -> i32 {
                     None => {
                         eprintln!("--value without a preceding --target-offset");
                         std::process::exit(2);
+                    }
+                }
+            }
+            "--read-offset" => {
+                let v = args.next().unwrap_or_else(|| {
+                    eprintln!("--read-offset requires a hex BAR0 offset, e.g. --read-offset 0x8e114, or a range --read-offset 0x8e110-0x8e140");
+                    std::process::exit(2);
+                });
+                if let Some((a, b)) = v.split_once('-') {
+                    // range form A-B: inclusive, 32-bit word step, capped
+                    let pa = u32::from_str_radix(a.trim_start_matches("0x").trim_start_matches("0X"), 16);
+                    let pb = u32::from_str_radix(b.trim_start_matches("0x").trim_start_matches("0X"), 16);
+                    match (pa, pb) {
+                        (Ok(lo), Ok(hi)) if lo < 0x0100_0000 && hi < 0x0100_0000 && lo <= hi => {
+                            let n = ((hi - lo) / 4 + 1) as usize;
+                            if n > 512 {
+                                eprintln!("--read-offset range {v:?} spans {n} words; cap is 512");
+                                std::process::exit(2);
+                            }
+                            let mut off = lo;
+                            while off <= hi {
+                                read_offsets.push(off);
+                                off += 4;
+                            }
+                        }
+                        _ => {
+                            eprintln!("bad --read-offset range {v:?}; need hex A-B with A<=B inside the 16 MiB aperture");
+                            std::process::exit(2);
+                        }
+                    }
+                } else {
+                    match u32::from_str_radix(v.trim_start_matches("0x").trim_start_matches("0X"), 16) {
+                        Ok(b) if b < 0x0100_0000 => read_offsets.push(b),
+                        _ => {
+                            eprintln!("bad --read-offset {v:?}; need a BAR0-relative hex offset inside the 16 MiB aperture");
+                            std::process::exit(2);
+                        }
                     }
                 }
             }
@@ -5450,6 +5686,25 @@ OPTIONS:
                    box (recovery = hard reset; the unlock state survives
                    reboots, rail-off clears it). On multi-GPU boxes pass
                    --select or the writes hit every card
+  --read-offset A  READ-ONLY probe, repeatable: read BAR0 offset A and
+                   print. Range form A-B also accepted (inclusive,
+                   32-bit word step, cap 512, e.g. 0x8e110-0x8e140).
+                   Same transport/risks class as --target-offset
+                   minus the write (reads at parked/gated offsets return
+                   badf poison, never hangs)
+  --bar1-scan      READ-ONLY: measure the real usable BAR1 - config control
+                   0xBC0 (hardware aperture) vs the 0xff-saturation boundary
+                   of the decoded region (16 dwords read at 15 offsets from
+                   256 MiB to 31 GiB through mapped BAR1 windows). Answers
+                   whether the hardware aperture matches what the driver
+                   believes, after loader-side ReBAR writes + hibernate
+                   resumes
+  --bar1-scan-write LIVE-GPU write-differentiate (corrupts <=16 bytes of
+                   driver VRAM for microseconds, restore-verified): flips
+                   one dword at 4 offsets (+1G/+8G/+16G/+31G, page-middles)
+                   and compares the flipped values across points - distinct
+                   values = independent decoded storage, shared value =
+                   aliased window. Recovery on fault = disable-enable/reboot
   --fuserows[=A-B] WRITE MODE per card: physical fuse-row capture via the
                    guarded ga100-ff-tools read_rows protocol (FUSEADDR row
                    select + FUSECTRL CMD_READ only, latch checks, two
@@ -5551,6 +5806,8 @@ SSDIAG_COLOR=force pins on.",
         eprintln!("--target-offset without a following --value (each offset needs exactly one value)");
         return 2;
     }
+    read_offsets.sort_unstable();
+    read_offsets.dedup();
 
     if let Err(msg) = validate_prom_bit_flags(prom_bit, reapply, fuserows.is_some(), !pokes.is_empty()) {
         eprintln!("{msg}");
@@ -5713,6 +5970,12 @@ SSDIAG_COLOR=force pins on.",
         // works even for a parked card (config space answers regardless of
         // D0/MEM decode) - hence before the BAR0 walk, not after
         print_config_rebar(&drv, &g.id, g.bdf);
+        if bar1_scan {
+            bar1_scan_probe(&drv, &g.id, g.bdf);
+        }
+        if bar1_scan_write_flag {
+            bar1_scan_write(&drv, &g.id, g.bdf);
+        }
         print_power_state(&drv, g.devinst, &g.id, g.bdf);
         print_rtd3_key(&g.id, g.devinst);
         let mut picked = walk_candidates(&drv, g);
@@ -5899,6 +6162,12 @@ SSDIAG_COLOR=force pins on.",
                 if !ok {
                     rc = 1;
                 }
+            }
+        }
+        if !read_offsets.is_empty() {
+            println!("read: {} offset(s), read-only", read_offsets.len());
+            for &off in &read_offsets {
+                println!("read {:#x} = {}", off, hx32(rd(off)));
             }
         }
         if let Some(range) = fuserows {

@@ -554,6 +554,174 @@ fn tx_one_card(g: &pci::FoundGpu) -> CardOutcome {
     };
     let gpu = tx::TxGpu { pci: &pci, bar: 0 };
 
+    // ---- \tx-rebar ladder (2026-11-24 bench line) --------------------------
+    // Rung 0 \tx-rebar-read.txt: read-only probe (config first, then the XVE
+    //   MMIO mirrors one log line each - isolates the first-run EFI hang).
+    // Main flow \tx-rebar.txt (size = decimal content, default 13): claim
+    //   first (the 11-22 discipline: never touch the card with firmware
+    //   drivers bound - the first run hung there), then the NV_30_DXE pair
+    //   with the route selected by markers:
+    //     default:       XVE MMIO mirrors (PciIo extended config is
+    //                    UNSUPPORTED on this firmware - rung-2 round proved
+    //                    it fail-closed)
+    //     +\tx-rebar-ecam.txt: ECAM-direct config access (RSDP->XSDT->MCFG)
+    //   Optional +\tx-sbr-gpu.txt: disciplined Secondary Bus Reset inside
+    //   the claimed window before the pair (display engine reset, straps
+    //   re-latched, BAR/command restored from the claim baseline).
+    // Every flow: NO FLR, no post-write reset - the pair must survive into
+    // Windows' boot enumeration; recovery = power-off.
+    let rebar_raw = chainload::boot_volume_read(uefi::cstr16!(r"\tx-rebar.txt"))
+        .map(|c| {
+            let s: alloc::string::String = c.iter().map(|&b| b as char).collect();
+            s
+        })
+        .unwrap_or_default();
+    let mut rebar_parts = rebar_raw.trim().split('/');
+    // content: "<select_idx>" or "<select_idx>/<advertise_field>" -
+    // select = the ReBAR control write (advisory; Windows re-arbitrates),
+    // advertise = the 0x610 field[10:7] value (the real ceiling; 9 = 32G,
+    // 13 = 512G per the 2026-11-24 field map).
+    let rebar_idx = rebar_parts
+        .next()
+        .and_then(|p| p.parse::<u32>().ok())
+        .filter(|&n| (1..=19).contains(&n))
+        .unwrap_or(13);
+    let rebar_adv = rebar_parts
+        .next()
+        .and_then(|p| p.parse::<u32>().ok())
+        .filter(|&n| n <= 15)
+        .unwrap_or(9);
+
+    if tx::probe_file("\\tx-rebar-read.txt") {
+        info!("TX: \\tx-rebar-read.txt present - rung 0: read-only rebar-face probe (config side proven, MMIO side experimental; hang there = the isolation answer)");
+        tx::probe_rebar_reads(&pci, &gpu);
+        tx::handoff_out(&pci);
+        return CardOutcome::Attempted;
+    }
+
+    if tx::probe_file("\\tx-rebar-scan.txt") {
+        let sbr_rung = tx::probe_file("\\tx-sbr-gpu.txt");
+        info!("TX: \\tx-rebar-scan.txt present - 0x610 field-encoding sweep + cap-mirror write probe (route {}, zero BAR-assignment writes; recovery = power-off)", if sbr_rung { "claim+SBR" } else { "claim" });
+        match crate::tx_detach::detach_and_claim(g.handle) {
+            Ok(claim) => {
+                info!("REBAR-SCAN: claimed (GOP off, screen dark by design)");
+                let mut sbr_ok = true;
+                if sbr_rung {
+                    let baseline = claim.baseline.clone();
+                    sbr_ok = revive::sbr_gpu_in_transaction(&gpu, &baseline);
+                    if sbr_ok {
+                        info!("REBAR-SCAN: SBR complete, device verified alive");
+                    } else {
+                        info!("REBAR-SCAN: SBR left the device unverifiable - halting without chain-load (power off completely, remove the stick, boot normally)");
+                    }
+                }
+                if sbr_ok {
+                    tx::run_rebar_fieldscan(&gpu);
+                    info!("SELECTOR RESULT: field sweep complete - see REBAR-SCAN lines above");
+                } else {
+                    logging::finish();
+                    loop {
+                        boot::stall(core::time::Duration::from_millis(500));
+                    }
+                }
+                drop(claim);
+                tx::handoff_out(&pci);
+            }
+            Err(e) => {
+                info!("REBAR-SCAN: claim failed ({e:?}) - refusing to touch a firmware-bound card; handing off untouched");
+                tx::handoff_out(&pci);
+            }
+        }
+        return CardOutcome::Attempted;
+    }
+
+    // \tx-rebar-then-tx.txt (2026-11-24): run the rebar pair AND the full
+    // unlock transaction in one boot. The pair lands inside the claim+SBR
+    // window (same as the rebar-only flow), the claim is released, and
+    // control FALLS THROUGH the rebar if-block to the transaction below -
+    // which re-claims fresh. Turing's unlock chain skips FLR (FEAT PLM does
+    // not survive it), so nothing in the transaction resets the pair away;
+    // the SS selectors + the 32G window land together at the handoff.
+    // Declared here so the flag survives past the rebar if-block's match
+    // scope (the fall-through must cross it).
+    let rebar_then_tx = tx::probe_file("\\tx-rebar-then-tx.txt");
+    if tx::probe_file("\\tx-rebar.txt") {
+        let sbr_rung = tx::probe_file("\\tx-sbr-gpu.txt");
+        let ecam_route = tx::probe_file("\\tx-rebar-ecam.txt");
+        info!(
+            "TX: \\tx-rebar.txt present (size_idx {rebar_idx}, advertise field {rebar_adv} (top idx {}), route {}, SBR {}) - claiming first (11-22 discipline), NO FLR, NO post-write reset; recovery = power-off",
+            rebar_adv as i32 - 2,
+            if ecam_route { "ECAM-direct" } else { "XVE-MMIO mirror" },
+            if sbr_rung { "yes" } else { "no" }
+        );
+        match crate::tx_detach::detach_and_claim(g.handle) {
+            Ok(claim) => {
+                info!("REBAR: claimed (GOP off, screen dark by design from here to the Windows driver)");
+                let mut sbr_ok = true;
+                if sbr_rung {
+                    let baseline = claim.baseline.clone();
+                    sbr_ok = revive::sbr_gpu_in_transaction(&gpu, &baseline);
+                    if sbr_ok {
+                        info!("REBAR: SBR complete, device verified alive, config restored from claim baseline");
+                    } else {
+                        info!("REBAR: SBR left the device unverifiable - halting without chain-load (power off completely, remove the stick, boot normally)");
+                    }
+                }
+                if sbr_ok {
+                    let pair = if ecam_route {
+                        tx::run_rebar_ecam((g.seg, g.bus, g.dev, g.fun), rebar_idx)
+                    } else {
+                        tx::run_rebar_mmio(&gpu, rebar_idx, rebar_adv)
+                    };
+                    match pair {
+                        Ok(()) => {
+                            let gop_reconnect = tx::probe_file("\\tx-rebar-gop.txt");
+                            info!(
+                                "SELECTOR RESULT: rebar pair written and readback-verified - {} before chaining",
+                                if gop_reconnect { "rebuilding the console GOP (\\tx-rebar-gop.txt ablation)" } else { "dark handoff" }
+                            );
+                            if gop_reconnect {
+                                if let Err(e) =
+                                    crate::gop_native::recover(g.handle, gpu.pci, claim.initial_attrs)
+                                {
+                                    info!("REBAR: native-GOP recovery failed ({e}) - chaining dark (Windows driver will re-enable the display)");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            info!("REBAR: pair failed ({e:?}) - handing off unchanged; no reset on this path, power-off clears any partial write");
+                        }
+                    }
+                } else {
+                    logging::finish();
+                    loop {
+                        boot::stall(core::time::Duration::from_millis(500));
+                    }
+                }
+                drop(claim);
+                if rebar_then_tx {
+                    info!("REBAR: \\tx-rebar-then-tx.txt present - claim released, FALLING THROUGH to the full unlock transaction (fresh claim inside; Turing skips FLR so the pair survives the chain)");
+                    // Fall through: no handoff_out, and NOT the match-tail
+                    // return below - control must leave this whole if-block
+                    // to reach the transaction code. The flag escapes the
+                    // match scope, so it is re-derived at the function level.
+                } else {
+                    tx::handoff_out(&pci);
+                    return CardOutcome::Attempted;
+                }
+            }
+            Err(e) => {
+                info!("REBAR: claim failed ({e:?}) - refusing to write against a firmware-bound card (the 11-22 soft-lock class); handing off untouched");
+                tx::handoff_out(&pci);
+            }
+        }
+        if !rebar_then_tx {
+            return CardOutcome::Attempted;
+        }
+        // rebar_then_tx: control reaches here having released the claim -
+        // continue below into the asset prechecks and run_transaction.
+    }
+
     // Per-family asset selection by PCI device ID - see asset_family.
     let dev = g.device_id;
     let Some(family) = asset_family(dev) else {

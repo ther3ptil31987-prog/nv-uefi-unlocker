@@ -113,21 +113,73 @@ booter 自己的指令（ROP 只是重排调用序）。
 - 机制已完整实证（Turing 侧，cmp50hx patch 04 + [cmp-gen2 §1](cmp-gen2-sm-unlock-assessment.md)）：
   载荷内开 **XP3G PLM 0x8e1b0** ← 0xffffffff，主机侧 7 项策略写
   （0x8841c/0x8e120/0x8e110/0x88610/0x8c2c0/0x8c040/0x8c1c0）+ LTSSM kick 0x8872c←6 +
-  配置空间 LNKCTL2 TLS=Gen2；**LnkSta 才是判据**（LnkCap 会说谎）。
+  配置空间 LNKCTL2 TLS=Gen2；**LnkSta 才是判据**（LnkCap 会说谎）。首步开门
+  无免 payload 替代——PLM 寄存器 host 直写已实测全拒（边界 9）。
 - 收益：矿卡 Gen1→Gen2 2× 链路带宽（P104-100 先例 p104-gen2-unlock 同理 2×；
   该先例走 PCI 配置空间+PL 内部寄存器运行期写——**正交车道**，不经 PLM）。
 - 卡点：Turing 帧预算 2 写封顶，XP3G 第三写进不去——**falcgen 的预算校验把这条
   边界变成了机械拒绝**（`--family tu102 --writes 0x8e1b0=…,0x409650=…,0x1fa828=…`
   → exit 2）。落地路径=pivot 重排（§1.2）或 stockflow 载荷审计。
 - 门控纪律：仅矿卡设备 ID（30/40/50HX=1exx/21xx、90HX=22xx），永不按"任意 Gen1
-  钳制卡"放宽。TU106 consumer 的 XP3G PLM 读 0xffffffff（OPEN）——40HX 卡对照
-  是下一轮输入（ssdiag PCIE_LINK_ROWS/XP3G 面已可采）。
+  钳制卡"放宽。
+- **TU106 consumer 机制探针（2026-11-24 三轮，已收口）**：XP3G PLM0 原生 OPEN 的
+  台架上，主机侧 9 写（50HX patch04 移植）全粘含 **config 镜像写穿透**（0x880a8←
+  TLS=Gen2，config space 读回跨轮持有）但速率不动（同读数 TLS=Gen2+LnkSta=Gen3
+  共存；Gen1/Gen2 观测=空闲 PM，P5/P8 节能，同轮 config Gen1→MMIO Gen3 动态可证）。
+  **第三轮翻案**：补 OVR3(0x8e11c)←4 + VAL3(0x8e12c)←**0x16480000**（=本卡
+  PCIE_MAGIC_D/XP3G_STATUS3 值，非 A100 的 0x200000——"VAL3=MAGIC_D 值"模式逐
+  die 映射）+ kick → **链路上限被钳到 Gen2**。"无压低机制/no gen3 override
+  register"（170HX #978 谱系）**不迁移到 Turing consumer**：slot3 就是活体 gen3
+  天花板旋钮。工作假设（待更多 die 验证）：slot0=Gen2 侧 override（矿卡 50HX 抬
+  限用它）、slot3=Gen3 侧 override（consumer 压限用它）——两方向旋钮都真实存在，
+  前一轮"方向反转"解读作废。可逆性（OVR3←0+kick 是否回 Gen3）与跨重启持久性
+  待测。evidence：docs/evidence/tu106-gen2-policy-probe/（三轮全录）。原生开归因
+  （本卡冷态纯读）与 40HX 对照仍待 Phase 0。
+  **轮四（同日）**：可逆性负结果——OVR3←0+kick 不回 Gen3，禁用-启用设备也不行
+  （MMIO config 寄存器无复位不洗）；config 头行 **LnkCap max Gen2 +
+  LnkCap2 [Gen1,Gen2]**=旋钮把 Gen3 从**能力向量**里摘除，作用层深于 TLS/MaxRate
+  ——同时解释轮一九写为何不动链路（那些写不治理，能力广告才是治理层）。
+  OVR3←0 只关使能，VAL3（0x16480000）与轮一全组仍脏。全量回退清单（首轮 dump
+  原值）：`0x8841c←0x20b40500 / 0x8e110←0 / 0x88610←0x1001 / 0x8c040←0x80045800 /
+  0x8c1c0←0x130036 / 0x880a8←0x1f0003 / 0x8e12c←0 / 0x8e11c←0 / 0x8872c←0`；
+  仍 Gen2 → 温重启（devinit/固件启动期改写=保证恢复路径）。
+  **轮五（同日 S4 休眠轮）**：rail-off 后 Gen3 能力向量全恢复（旋钮=power-cycle-
+  volatile，无持久损害）；XP3G 策略寄存器全组回原值；残余=驱动从休眠镜像重放
+  链路策略（LINK_CONFIG_0 [19:18]=2、LnkSta 暂挂 Gen2），禁用-启用自愈。
+  **Phase 0 同轮收口**：本 boot payload 只写 FEAT——XP3G PLM0 与 FUSECTRL/FUSEOPT
+  PLM 在 rail-off 后仍 0xffffffff = **TU106 consumer 原生开**（scan 副作用假设
+  作废）。TU11x 对照待社区探针（ssdiag gen2 face 已印 XP3G_PLM0，一行读数即可
+  扩格）。**轮五b 负控→轮六/七二分到底**：slot3 单打不钳，但经逐级消减，**终极
+  配方 = 3 态写 + 驱动重初始化**：`0x88610←0x1（VSEC_HIERARCHY 清 bit12=武装位）+
+  0x8e12c←0x16480000（VAL3=本卡 PCIE_MAGIC_D 值，逐 die 映射）+ 0x8e11c←4
+  （slot3 使能）`，然后 `nvoc-cli restart-display-driver`（驱动重 init 重读能力
+  向量；设备管理器禁用-启用同效；硬件层 idle 重协商与带内 kick 不算触发）；回
+  3.0 = 三项回原值（0x88610←0x1001 等）+ 同触发。原 50HX 十二写链 consumer 化
+  压缩到 3 写。九写中的 TLS/PRIV_MISC_1/MAX_RATE/PL_LINK_RATE/OVR0/VAL0/CYA_0
+  与 kick 全部退役；power-cycle-volatile。**双向边界（轮八）**：旋钮只降不升——
+  Gen1 锁在已知字段不可达（MAX_RATE=00 无效，GEN1 需未知的 VAL 编码，搁置）；
+  Gen4 广告不可抬（LnkCap/LnkCap2 PRI 镜像写拒=capability 广告 host 只读，
+  MAX_RATE=11b 顶在 Gen3 硅顶）。evidence：docs/evidence/tu106-gen2-
+  policy-probe/（八轮全录）。
 
 ### 2.4 Turing BAR1 ReBAR（strap 层，不需要载荷）
 
 PSTRAPS SET0[15:14]+SET1[22:20]（BAR0+0x101000/0x10100c，和值编码 0=64MiB…10=64GiB）
 在平台 DXE PCIe 枚举期写（NvStrapsReBar 实证，OQ#11）——**与 SEC2 载荷正交**，载具是
 主板 UEFI 镜像内 DXE 驱动。app 期改 straps 需自重配 PCI 窗口，若做须单独立项。
+**in-OS 分叉（2026-11-24 TU106 台架，两轮）**：PSTRAPS 主机直写**粘住**且经设备
+管理器禁用-启用循环保留——载具问题重开。轮二实测：SET1（part2=7+bit31）全粘，
+**SET0[15:14]（part1）被硅写掩码**（写入含位、读回无，二次确认）→ **in-OS 可达
+BAR1 index 上限=7=8GiB**（16/32/64G 需 part1，host 拿不到；8GB 显存卡 8GiB 恰是
+经典 ReBAR 目标）；override_en=1 生效后 **config ReBAR cap 0x15 整个消失**——
+straps override 下设备改呈固定尺寸 BAR，可调 BAR 机制被抑制（cap 广告=straps
+派生的机制 datum）。现态：BAR1 straps index 7=8GiB + override_en=1（SET0=
+0x80400080 含原 bit22、SET1=0x82713000）。**S4 判别完成（同日轮三）**：rail-off
+后 straps 全回厂值（override_en=0、index 0）+ ReBAR cap 0x15 回归——reset-reload
+模型确认，**in-OS PSTRAPS 写不活过断电，载具革命不成立**：in-OS 写定性=会话内
+诊断工具；ReBAR 载具维持 DXE（NvStrapsReBar），in-OS 活窗增长留给 0x610 型
+FB override 思路（#211）。轮二的机制 datum（part1 硅掩码→in-OS 上限 8GiB；
+override_en 抑制 cap 广告）保持。evidence：docs/evidence/tu106-pstraps-inos-probe/。
 注意 §2.2 的尺寸表与这里是同一张 64MiB<<i 表的两个消费方。
 
 ### 2.5 登记行（证据在库、无落地路径或无收益）
@@ -179,6 +231,19 @@ PSTRAPS SET0[15:14]+SET1[22:20]（BAR0+0x101000/0x10100c，和值编码 0=64MiB�
 8. **逐芯片几何**：booter 尺寸/gadget 地址/签名段名逐族不同——跨族移植=重抽取重审计
    （宪法 §9.1）；falcgen 把"新 die 边际成本"降到一把 debug key + 一条命令，但
    **不降低审计义务**。
+9. **PLM 寄存器自身写域（2026-11-24 TU106 台架 11 点实测）**：可读 ≠ 可写——
+   11 个 closed-stock PLM（GFW 0x118128、XVE 0x88ab4、FUSE-WDATA 0x210f4/
+   0x8200e0/0x8200e4、PMU 0x100b10/0x100b38/0x100b84、FBPA 0x9a0148/0x9a0168/
+   0x9a0554）host 写 0xffffffff 全部静默丢弃，读回逐位保持原值（0xffffff8f/
+   0xffffff88/0xffffffcf 三形状一致，无 sticky 位——与 FEAT 0xef erratum 形成
+   closed/open 两态对照）。**"开门只能由 payload 干"从推断变为实测边界**：
+   系统内级联开门不存在；寄存器按所在块 PLM 过滤（SS0/SS1 bench 的粘住面），
+   而 PLM 寄存器本身恒 L3。顺带含义：§2.3 矿卡 gen2 的"载荷内开 XP3G PLM0"
+   没有免 payload 替代路径。evidence：docs/evidence/tu106-plm-cascade-probe/。
+   第三格补齐（同日）：closed PLM 后普通寄存器同拒（GFW_SCRATCH 0x118234←0 读回
+   0x3ff）+ GR_TOPO 0x409604 host 写拒（可读不可写）——写域四格矩阵闭合：PLM
+   寄存器 closed=拒/open=部分 sticky（0xef erratum）；普通寄存器 open 门后=粘/
+   closed 门后=拒。
 
 ## 4. falcgen 工具面（本轮落地）
 
@@ -203,11 +268,22 @@ falcgen synth --family tu102 --writes 0x8e1b0=0xffffffff,0x409650=0xffffffff,0x1
 
 ## 5. 未来行（登记，不承诺）
 
-- **Pascal（10 系）**：FWSEC 走 V1 描述符（接口偏移布局不同）；无 FEAT selector 域
-  记载（Turing 的 0x823xxx 在 Turing 自身都 badf，Pascal 更无人测绘）。候选门：
-  ①PCIe Gen2（P104 先例=配置空间+PL 寄存器运行期写，正交车道，无需 SEC2 载荷）；
-  ②FP64 速率机理未知。无 debug key 公开记录=生成器无输入（边界 5）。先做只读
-  词典轮（ssdiag GA100VFI 词典路径），再谈载体。
+- **Pascal（10 系）/ Volta**（2026-11-24 考察修正，证据=open-gpu-kernel-modules
+  615.78.08 + linux-firmware + nova 内核文档）：**有 SEC2 与硬件安全引导链**（此前
+  "SEC2 是 Turing 引入"的表述错误——linux-firmware `nvidia/gp102/sec2/` =
+  desc/image/sig 三元组旧容器格式、`acr/` 161 条、`gr/` fecs/gpccs 签名固件；nova
+  文档的 HS/LS 模型与 BROM 硬件验签适用到 Ampere 或更早）。**无 GSP**（open 模块
+  README："Turing or later"；gsp/sec2 arch 实现树无 Pascal/Volta 目录；swref
+  pascal/gp102 仅 6 头文件，连 dev_sec2.h 都没有）——GSP-RM、WPR2/FRTS、FEAT
+  cluster 全为 Turing+ 语义。**falcgen 车道不适用，三前提全断**：①sec2 固件
+  公开可下载但容器是旧格式且加密状态未证、GP10x debug key 无公开破解（硬边界 5）；
+  ②无界签名 DMA 未证实存在（Turing booter 特定形状，Pascal sec2 无人审计）；③
+  FEAT selector 轴不存在（结构性缺失）。ISA 层 fuc4≠fuc5（envydis 变体表齐全
+  =解码器可转录，但 CRYPT 特性/参数表/环境模型需平行实现）——**falcgen 定位
+  保持"GSP 时代 SEC2 booter RE 工具"，Pascal falcon 审计是独立 RE 项目（未立项）**。
+  候选门：①PCIe Gen2（P104 先例=配置空间+PL 寄存器运行期写，正交车道，无需
+  SEC2 载荷）；②FP64 速率机理未知。先做只读词典轮（ssdiag GA100VFI 词典路径），
+  再谈载体。
 - **Gen2 pivot**（§1.2 路径 1）：envdis 审计 cmp50hx stockflow 载荷 + falcgen pivot
   文法，单独立项。
 - **FLR 间隔多发**（§1.2 路径 2）：需守卫语义分级 + 全 parity 干净收尾先行，单独立项。
