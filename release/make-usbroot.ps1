@@ -18,13 +18,18 @@
 #                     FAT32 partition without asking; the volume must pass the
 #                     same eligibility checks as the probe)
 #   .\make-usbroot.ps1 -AutoRun 10         (arm auto-run at build time: write
-#                     i_know_what_i_am_doing.txt = 10s countdown, any key
-#                     aborts; 0 = no wait, loader v2.1.12-rc1+; "off" pins
-#                     the default; explicit value skips the interactive ask)
-#   .\make-usbroot.ps1 -Quiet              (write tx-quiet.txt; same as the
-#                     interactive ask, skips it)
-#   .\make-usbroot.ps1 -Ultrafast          (write tx-ultrafast.txt; verified-
-#                     machine speed profile, ask's default stays No)
+#                     i_know_what_i_am_doing = 10 into \tx.ini - 10s countdown,
+#                     any key aborts; 0 = no wait, loader v2.1.12-rc1+; "off"
+#                     pins the default; explicit value skips the interactive
+#                     ask)
+#   .\make-usbroot.ps1 -Quiet              (write output = quiet into \tx.ini;
+#                     same as the interactive ask, skips it)
+#   .\make-usbroot.ps1 -Ultrafast          (write output = ultrafast into
+#                     \tx.ini; verified-machine speed profile, ask's default
+#                     stays No)
+#   .\make-usbroot.ps1 -LegacyMarkers      (pre-tx.ini layout: write the
+#                     individual marker files instead of \tx.ini - for older
+#                     release binaries; never mix with the ini on one stick)
 #   .\make-usbroot.ps1 -ChainTarget windows
 #                     (pin the chainload handoff, issue #204: 'windows' |
 #                     'ubuntu' | 'systemd' presets, a volume-relative EFI
@@ -157,6 +162,17 @@ param(
     # loader falls back to the default chain order, and no GPU-behavior
     # knob is touched.
     [string]$ChainTarget = "",
+    # Write the four config choices into a single \tx.ini (issue #290,
+    # loader 2.1.12-feat-tx-ini+). Default ON. Off (-LegacyMarkers) writes
+    # the individual marker files the pre-ini loaders consume; both shapes
+    # boot identically on a current build, and an ini arm plus its marker
+    # file together is a boot refusal, so never mix them on one stick.
+    [switch]$IniConfig = $true,
+    # Legacy layout for pre-tx.ini loaders: write i_know_what_i_am_doing.txt
+    # / tx-quiet.txt / tx-ultrafast.txt / chain-target.txt as individual
+    # files instead of the consolidated tx.ini. Older release binaries
+    # (<= 2.1.12-rc7) only understand this shape.
+    [switch]$LegacyMarkers,
     # Skip the interactive marker ask entirely (scripted runs); explicit
     # -AutoRun/-Quiet already skip it. Neither arms anything: the default
     # build is unarmed (AGENTS.deploy.md handoff doctrine).
@@ -1256,12 +1272,11 @@ foreach ($sec in @("fwimage_ga10x.bin", "fwsignature_ga10x.bin",
     }
 }
 
-$expected += "BOOTX64.EFI"
-Copy-Item $BootEfi (Join-Path $Out "BOOTX64.EFI") -Force
-
-# The firmware only auto-boots \EFI\BOOT\BOOTX64.EFI; a flat copy of $Out puts the
-# executable at the root and the boot menu silently bounces back (issue #142). Emit
-# the real path too, so "copy the contents" is literally sufficient.
+# The firmware only auto-boots \EFI\BOOT\BOOTX64.EFI (issue #142). Emit the
+# real path ONLY: a flat copy in $Out (the pre-#142 shape) misled stick-makers
+# into copying the executable to the volume root, where it is dead weight and
+# reads like a second loader. "Copy the contents" now yields exactly the
+# bootable shape and nothing else.
 New-Item -ItemType Directory -Force -Path (Join-Path $Out "EFI/BOOT") | Out-Null
 Copy-Item $BootEfi (Join-Path $Out "EFI/BOOT/BOOTX64.EFI") -Force
 
@@ -1285,12 +1300,29 @@ Write-Host ("  {0,-28} " -f "EFI/BOOT/BOOTX64.EFI") -ForegroundColor Magenta -No
 # diagnostic or exit valve and must not be blanket-enabled from a menu.
 function Invoke-MarkerOffer {
     $markers = @()
+    $iniLines = @()
+    # Config shape: tx.ini by default (issue #290), the individual marker
+    # files under -LegacyMarkers (pre-tx.ini loaders). The menu ask below
+    # surfaces the choice only interactively; scripted runs take the
+    # parameter as-is. The two shapes must never mix on one stick (an ini
+    # arm plus its marker file is a boot refusal).
+    $script:UseIni = (-not $LegacyMarkers)
     # One rule for the whole ask block: any explicit marker choice
     # (-AutoRun/-Quiet/-Ultrafast/-ChainTarget) or -NoMarkerPrompt makes this
     # a scripted run - no prompts; every unspecified choice takes its
     # documented default (unarmed, plain console, no pin, no ultrafast).
     $menuInteractive = ($AutoRun -eq "" -and -not $Quiet -and -not $Ultrafast -and
                         $ChainTarget -eq "" -and -not $NoMarkerPrompt)
+    if ($menuInteractive) {
+        Write-Step "[config] config shape: \tx.ini (single file, docs/tx-ini.md) is the default;"
+        Write-Step "[config]   legacy individual marker files only matter for pre-tx.ini binaries."
+        $lAns = $null
+        try { $lAns = Read-Host "[config] write legacy markers instead of tx.ini? y/N" } catch { $lAns = $null }
+        if ($lAns -and $lAns.Trim() -match '^(y|yes)$') {
+            $script:UseIni = $false
+            Write-Ok2 "[config] legacy marker layout selected"
+        }
+    }
     $seconds = $null
     if ($AutoRun -ne "") {
         # Explicit parameter wins and skips the ask.
@@ -1331,27 +1363,60 @@ function Invoke-MarkerOffer {
         }
     }
     if ($null -ne $seconds) {
-        Set-Content -Path (Join-Path $Out "i_know_what_i_am_doing.txt") -Value $seconds -Encoding Ascii
-        $markers += "i_know_what_i_am_doing.txt"
-        Write-Ok2 ("[marker] ARMED: i_know_what_i_am_doing.txt = {0}s countdown auto-run, any key aborts" -f $seconds)
-        if ($seconds -eq 0) {
-            Write-Step "[marker]   0 = no wait - needs loader v2.1.12-rc1 or newer (older clamps to 1s)"
+        if ($script:UseIni) {
+            $iniLines += "i_know_what_i_am_doing = $seconds"
+            Write-Ok2 ("[ini] ARMED: i_know_what_i_am_doing = {0}s countdown auto-run, any key aborts" -f $seconds)
+            if ($seconds -eq 0) {
+                Write-Step "[ini]   0 = no wait - needs loader v2.1.12-rc1 or newer (older clamps to 1s)"
+            }
+        } else {
+            Set-Content -Path (Join-Path $Out "i_know_what_i_am_doing.txt") -Value $seconds -Encoding Ascii
+            $markers += "i_know_what_i_am_doing.txt"
+            Write-Ok2 ("[marker] ARMED: i_know_what_i_am_doing.txt = {0}s countdown auto-run, any key aborts" -f $seconds)
+            if ($seconds -eq 0) {
+                Write-Step "[marker]   0 = no wait - needs loader v2.1.12-rc1 or newer (older clamps to 1s)"
+            }
         }
     }
     $wantQuiet = $false
-    if ($Quiet) {
-        $wantQuiet = $true
+    $wantFast = $false
+    if ($Quiet -or $Ultrafast) {
+        # Explicit flags preset the profile and skip the ask (same contract
+        # as before; -Ultrafast wins if both are passed - it folds quiet).
+        $wantQuiet = ($Quiet -and -not $Ultrafast)
+        $wantFast = $Ultrafast
     } elseif ($menuInteractive) {
-        $qAns = $null
-        try { $qAns = Read-Host "[marker] quiet console (tx-quiet.txt, verdict lines only)? y/N" } catch { $qAns = $null }
-        $wantQuiet = ($qAns -and $qAns.Trim() -match '^(y|yes)$')
+        if ($script:UseIni) {
+            # \tx.ini models output as ONE three-way key, so the ask is one
+            # three-way question (issue #290 follow-up). Ultrafast folds
+            # quiet; its first-run-debuggability caveat comes along.
+            Write-Step "[marker]   output profile: normal shows every log line on console; quiet shows"
+            Write-Step "[marker]   verdict lines only (loader.log stays full); ultrafast additionally skips"
+            Write-Step "[marker]   the diagnostic probes (faster boots, bigger log blind spots on a hang -"
+            Write-Step "[marker]   only for machines already verified over multiple rounds)."
+            $qAns = $null
+            try { $qAns = Read-Host "[marker] output profile: Enter = normal, 1 = quiet, 2 = ultrafast" } catch { $qAns = $null }
+            $qAns = $(if ($qAns) { $qAns.Trim() } else { "" })
+            $wantQuiet = ($qAns -eq "1")
+            $wantFast = ($qAns -eq "2")
+        } else {
+            # Legacy marker world: two separate files, two separate asks.
+            $qAns = $null
+            try { $qAns = Read-Host "[marker] quiet console (verdict lines only)? y/N" } catch { $qAns = $null }
+            $wantQuiet = ($qAns -and $qAns.Trim() -match '^(y|yes)$')
+        }
     }
     if ($wantQuiet) {
-        Set-Content -Path (Join-Path $Out "tx-quiet.txt") -Value "" -Encoding Ascii -NoNewline
-        $markers += "tx-quiet.txt"
-        Write-Ok2 "[marker] quiet console enabled (tx-quiet.txt - loader.log stays full)"
-    } elseif ($AutoRun -ne "") {
-        Write-Step "[marker] quiet console not requested (-Quiet writes tx-quiet.txt)"
+        if ($script:UseIni) {
+            $iniLines += "output = quiet"
+            Write-Ok2 "[ini] quiet console enabled (output = quiet - loader.log stays full)"
+        } else {
+            Set-Content -Path (Join-Path $Out "tx-quiet.txt") -Value "" -Encoding Ascii -NoNewline
+            $markers += "tx-quiet.txt"
+            Write-Ok2 "[marker] quiet console enabled (tx-quiet.txt - loader.log stays full)"
+        }
+    } elseif ($AutoRun -ne "" -and -not $wantFast) {
+        Write-Step "[marker] output profile: normal (default)"
     }
     # Chain-target pin (issue #204): a handoff-shape declaration, not a GPU
     # knob - the loader falls back to the default chain order when the
@@ -1433,33 +1498,95 @@ function Invoke-MarkerOffer {
         }
     }
     if ($chainPath) {
-        Set-Content -Path (Join-Path $Out "chain-target.txt") -Value $chainPath -Encoding Ascii
-        $markers += "chain-target.txt"
-        Write-Ok2 ("[marker] chain pinned: chain-target.txt = {0}" -f $chainPath)
+        if ($script:UseIni) {
+            $iniLines += "chain_target = $chainPath"
+            Write-Ok2 ("[ini] chain pinned: chain_target = {0}" -f $chainPath)
+        } else {
+            Set-Content -Path (Join-Path $Out "chain-target.txt") -Value $chainPath -Encoding Ascii
+            $markers += "chain-target.txt"
+            Write-Ok2 ("[marker] chain pinned: chain-target.txt = {0}" -f $chainPath)
+        }
     }
-    # Ultrafast profile: the one speed option whose default must stay No -
-    # it skips the diagnostic stages that make a FIRST run debuggable
-    # (M1 sampling, GOP probes, AUTH-SCAN, dumps; bigger log blind spots on
-    # a hang). For sticks rebuilt for machines already verified over
-    # multiple rounds (docs/faq.md). It folds quiet on the loader side, so
-    # tx-quiet.txt next to it is redundant (noted, harmless either way).
-    $wantFast = $false
-    if ($Ultrafast) {
-        $wantFast = $true
-    } elseif ($menuInteractive) {
-        Write-Step "[marker]   ultrafast (tx-ultrafast.txt): skips the diagnostic probes and folds"
-        Write-Step "[marker]   quiet - faster boots, bigger log blind spots on a hang. Only for"
-        Write-Step "[marker]   machines already verified over multiple rounds (docs/faq.md)."
-        $uAns = $null
-        try { $uAns = Read-Host "[marker] ultrafast speed profile? y/N" } catch { $uAns = $null }
-        $wantFast = ($uAns -and $uAns.Trim() -match '^(y|yes)$')
-    }
+    # Ultrafast application (the ask above covers it in ini mode; legacy
+    # mode keeps its own second ask because the marker world has two files).
+    # The profile skips the diagnostic stages that make a FIRST run
+    # debuggable (M1 sampling, GOP probes, AUTH-SCAN, dumps), so its ask
+    # default stays No and the docs steer it to rebuilt sticks for machines
+    # already verified over multiple rounds (docs/faq.md).
     if ($wantFast) {
-        Set-Content -Path (Join-Path $Out "tx-ultrafast.txt") -Value "" -Encoding Ascii -NoNewline
-        $markers += "tx-ultrafast.txt"
-        Write-Ok2 "[marker] ultrafast enabled (tx-ultrafast.txt - verdict read-backs still run)"
-        if ($wantQuiet) {
-            Write-Step "[marker]   ultrafast folds quiet - tx-quiet.txt alongside is redundant"
+        if ($script:UseIni) {
+            $iniLines += "output = ultrafast"
+            Write-Ok2 "[ini] ultrafast enabled (output = ultrafast - verdict read-backs still run)"
+        } else {
+            Set-Content -Path (Join-Path $Out "tx-ultrafast.txt") -Value "" -Encoding Ascii -NoNewline
+            $markers += "tx-ultrafast.txt"
+            Write-Ok2 "[marker] ultrafast enabled (tx-ultrafast.txt - verdict read-backs still run)"
+            if ($wantQuiet) {
+                Write-Step "[marker]   ultrafast folds quiet - tx-quiet.txt alongside is redundant"
+            }
+        }
+    }
+    if ($script:UseIni) {
+        if ($iniLines.Count -gt 0) {
+            $iniText = "# \tx.ini - consolidated stick config (docs/tx-ini.md; marker files stay valid for arms not set here)`r`n" + (($iniLines | ForEach-Object { $_ + "`r`n" }) -join "")
+            Set-Content -Path (Join-Path $Out "tx.ini") -Value $iniText -Encoding Ascii -NoNewline
+            $markers += "tx.ini"
+            Write-Ok2 ("[ini] wrote tx.ini with {0} arm(s): {1}" -f $iniLines.Count, ($iniLines -join "; "))
+            # Conflict sweep: a marker file whose arm this ini sets turns the
+            # whole boot into an INI-REFUSED refusal (the loader's no-silent-
+            # precedence rule). Old sticks carry last season's markers - list
+            # the conflicting ones and offer deletion (default N; scripted
+            # runs are only warned, never delete unattended). Non-conflicting
+            # markers stay valid fallbacks by design and are left alone.
+            $iniTextAll = $iniText
+            $conflictMap = @(
+                @{ pattern = '(?m)^i_know_what_i_am_doing\s*='; file = "i_know_what_i_am_doing.txt" },
+                @{ pattern = '(?m)^output\s*='; file = "tx-quiet.txt" },
+                @{ pattern = '(?m)^output\s*='; file = "tx-ultrafast.txt" },
+                @{ pattern = '(?m)^chain_target\s*='; file = "chain-target.txt" }
+            )
+            $conflicts = @($conflictMap | Where-Object {
+                ($iniTextAll -match $_.pattern) -and (Test-Path (Join-Path $Out $_.file))
+            } | ForEach-Object { $_.file })
+            if ($conflicts.Count -gt 0) {
+                Write-WarnY ("[ini] conflicting marker file(s) on the target - an ini arm plus its marker file is a boot refusal (INI-REFUSED): {0}" -f ($conflicts -join ", "))
+                if ($menuInteractive) {
+                    $dAns = $null
+                    try { $dAns = Read-Host "[ini] delete the conflicting marker file(s)? y/N" } catch { $dAns = $null }
+                    if ($dAns -and $dAns.Trim() -match '^(y|yes)$') {
+                        foreach ($cf in $conflicts) {
+                            Remove-Item -LiteralPath (Join-Path $Out $cf) -Force
+                            Write-Ok2 ("[ini] deleted stale marker: {0}" -f $cf)
+                        }
+                    } else {
+                        Write-WarnY "[ini] kept - the stick will REFUSE to boot until they are removed (fix the lines above)"
+                    }
+                } else {
+                    Write-WarnY "[ini] scripted run - not deleting; remove them manually or the stick will REFUSE to boot (INI-REFUSED)"
+                }
+            }
+        } else {
+            Write-Step "[ini] no arms selected - no tx.ini written (all-default stick)"
+        }
+    } else {
+        # Legacy shape: a leftover \tx.ini on the target may set arms the
+        # legacy markers do not (and a new-binary boot would see double-set
+        # refusals). Offer the same confirm-delete sweep, default N.
+        $iniPath = Join-Path $Out "tx.ini"
+        if (Test-Path $iniPath) {
+            Write-WarnY "[legacy] \tx.ini present on the target - mixed shapes cause boot refusals (an ini arm plus its marker file double-sets the arm)"
+            if ($menuInteractive) {
+                $dAns = $null
+                try { $dAns = Read-Host "[legacy] delete the stale tx.ini? y/N" } catch { $dAns = $null }
+                if ($dAns -and $dAns.Trim() -match '^(y|yes)$') {
+                    Remove-Item -LiteralPath $iniPath -Force
+                    Write-Ok2 "[legacy] deleted stale tx.ini"
+                } else {
+                    Write-WarnY "[legacy] kept - remove it manually or a new-binary boot may REFUSE (INI-REFUSED)"
+                }
+            } else {
+                Write-WarnY "[legacy] scripted run - not deleting; remove tx.ini manually or a new-binary boot may REFUSE"
+            }
         }
     }
     return $markers

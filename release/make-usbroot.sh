@@ -64,6 +64,9 @@
 #                     or "off"; "" asks the menu - Windows / GRUB /
 #                     systemd-boot / Ubuntu / shim / custom path, default
 #                     no pin
+#   --legacy-markers  pre-tx.ini layout: individual marker files instead of
+#                     the consolidated \tx.ini (older release binaries;
+#                     never mix with the ini on one stick)
 #   --no-marker-prompt  skip the interactive marker ask
 #   -h | --help       this text
 #
@@ -115,17 +118,23 @@ NO_INSTALL_PROMPT=0
 INSTALL_TO=""
 # Confirm-gate choice at build time (issue #259). "" = the interactive ask
 # decides (its default keeps the loader's 30s keypress confirm); "off" pins
-# that default non-interactively; 0-30 arms auto-run (i_know_what_i_am_doing.txt
-# = the seconds; 0 = no wait, loader v2.1.12-rc1+). QUIET writes tx-quiet.txt,
-# ULTRAFAST=1 writes tx-ultrafast.txt (verified-machine speed profile), and
-# CHAIN_TARGET pins the handoff ("" = ask the menu's y/N for the Windows pin,
-# "off" = skip, otherwise a volume-relative EFI path, issue #204).
+# that default non-interactively; 0-30 arms auto-run (i_know_what_i_am_doing
+# = the seconds in \tx.ini; 0 = no wait, loader v2.1.12-rc1+). QUIET writes
+# output = quiet, ULTRAFAST=1 writes output = ultrafast (verified-machine
+# speed profile), and CHAIN_TARGET pins the handoff ("" = ask the menu's y/N
+# for the Windows pin, "off" = skip, otherwise a volume-relative EFI path,
+# issue #204). LEGACY_MARKERS=1 writes the individual pre-tx.ini marker
+# files instead of the consolidated \tx.ini - the two shapes must never mix
+# on one stick (an ini arm plus its marker file is a boot refusal).
 # A normal build stays UNARMED (AGENTS.deploy.md handoff doctrine).
 AUTO_RUN=""
 QUIET=0
 ULTRAFAST=0
 CHAIN_TARGET=""
 NO_MARKER_PROMPT=0
+LEGACY_MARKERS=0
+USE_INI=1
+INI_LINES=()
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 # Windows-hosted bash (Git Bash/MSYS) can run .exe pipelines, not Linux ELF;
@@ -265,6 +274,7 @@ while [ $# -gt 0 ]; do
         --ultrafast)       ULTRAFAST=1; shift ;;
         --chain-target)    CHAIN_TARGET="${2:?missing value for $1}"; shift 2 ;;
         --chain-target=*)  CHAIN_TARGET="${1#*=}"; shift ;;
+        --legacy-markers)  LEGACY_MARKERS=1; USE_INI=0; shift ;;
         --no-marker-prompt) NO_MARKER_PROMPT=1; shift ;;
         -h|--help)         usage ;;
         *) die "unknown option: $1 (see --help)" ;;
@@ -1047,9 +1057,6 @@ for fam in "${FAMILIES[@]}"; do
     esac
 done
 
-cp -f "$BOOT_EFI" "$OUT/BOOTX64.EFI"
-expected+=("BOOTX64.EFI")
-
 # ---------- intermediates off the root ----------
 # The full GSP ELFs (gsp_ga10x.bin / gsp_tu10x.bin) are extraction
 # INTERMEDIATES: gsp-sections has consumed them and the loader reads only
@@ -1070,8 +1077,11 @@ for sec in fwimage_ga10x.bin fwsignature_ga10x.bin fwimage_ad10x.bin fwsignature
     [ -f "$OUT/$sec" ] && rm -f -- "$OUT/$sec"
 done
 
-# Firmware only auto-boots \EFI\BOOT\BOOTX64.EFI; a flat copy of $OUT leaves the
-# executable at the root and the boot menu bounces back (issue #142).
+# Firmware only auto-boots \EFI\BOOT\BOOTX64.EFI (issue #142). Emit the real
+# path ONLY: a flat copy in $Out (the pre-#142 shape) misled stick-makers into
+# copying the executable to the volume root, where it is dead weight and reads
+# like a second loader. "Copy the contents" now yields exactly the bootable
+# shape and nothing else.
 mkdir -p "$OUT/EFI/BOOT"
 cp -f "$BOOT_EFI" "$OUT/EFI/BOOT/BOOTX64.EFI"
 
@@ -1104,6 +1114,16 @@ marker_offer() {
     if [ -z "$AUTO_RUN" ] && [ "$QUIET" -eq 0 ] && [ "$ULTRAFAST" -eq 0 ] \
        && [ -z "$CHAIN_TARGET" ] && [ "$NO_MARKER_PROMPT" -eq 0 ] && [ -t 0 ]; then
         menu_interactive=1
+    fi
+    # Config shape ask (ini default, issue #290): interactive only; scripted
+    # runs take --legacy-markers as-is. The two shapes must never mix on one
+    # stick (an ini arm plus its marker file is a boot refusal).
+    if [ "$menu_interactive" -eq 1 ]; then
+        log "[config] config shape: \\tx.ini (single file, docs/tx-ini.md) is the default;"
+        log "[config]   legacy individual marker files only matter for pre-tx.ini binaries."
+        local lans=""
+        read -r lans || lans=""
+        case "${lans,,}" in y|yes) USE_INI=0; log "[config] legacy marker layout selected" ;; esac
     fi
     local seconds=""
     if [ -n "$AUTO_RUN" ]; then
@@ -1143,25 +1163,54 @@ marker_offer() {
         fi
     fi
     if [ -n "$seconds" ]; then
-        printf '%s\n' "$seconds" > "$OUT/i_know_what_i_am_doing.txt"
-        MARKER_FILES+=("i_know_what_i_am_doing.txt")
-        log "[marker] ARMED: i_know_what_i_am_doing.txt = ${seconds}s countdown auto-run, any key aborts"
-        [ "$seconds" = "0" ] && log "[marker]   0 = no wait - needs loader v2.1.12-rc1 or newer (older clamps to 1s)"
+        if [ "$USE_INI" -eq 1 ]; then
+            INI_LINES+=("i_know_what_i_am_doing = $seconds")
+            log "[ini] ARMED: i_know_what_i_am_doing = ${seconds}s countdown auto-run, any key aborts"
+            [ "$seconds" = "0" ] && log "[ini]   0 = no wait - needs loader v2.1.12-rc1 or newer (older clamps to 1s)"
+        else
+            printf '%s\n' "$seconds" > "$OUT/i_know_what_i_am_doing.txt"
+            MARKER_FILES+=("i_know_what_i_am_doing.txt")
+            log "[marker] ARMED: i_know_what_i_am_doing.txt = ${seconds}s countdown auto-run, any key aborts"
+            [ "$seconds" = "0" ] && log "[marker]   0 = no wait - needs loader v2.1.12-rc1 or newer (older clamps to 1s)"
+        fi
     fi
     local want_quiet=0
-    if [ "$QUIET" -eq 1 ]; then
-        want_quiet=1
+    local want_fast=0
+    if [ "$QUIET" -eq 1 ] || [ "$ULTRAFAST" -eq 1 ]; then
+        # Explicit flags preset the profile and skip the ask (--ultrafast
+        # wins if both are passed - it folds quiet).
+        if [ "$ULTRAFAST" -eq 1 ]; then want_fast=1
+        else want_quiet=1; fi
     elif [ "$menu_interactive" -eq 1 ]; then
-        local qans=""
-        read -r qans || qans=""
-        case "${qans,,}" in y|yes) want_quiet=1 ;; esac
+        if [ "$USE_INI" -eq 1 ]; then
+            # \tx.ini models output as ONE three-way key, so the ask is one
+            # three-way question (issue #290 follow-up). Ultrafast folds
+            # quiet; its first-run-debuggability caveat comes along.
+            log "[marker]   output profile: normal shows every log line on console; quiet shows"
+            log "[marker]   verdict lines only (loader.log stays full); ultrafast additionally skips"
+            log "[marker]   the diagnostic probes (faster boots, bigger log blind spots on a hang -"
+            log "[marker]   only for machines already verified over multiple rounds)."
+            local qans=""
+            read -r qans || qans=""
+            case "${qans,,}" in 1) want_quiet=1 ;; 2) want_fast=1 ;; esac
+        else
+            # Legacy marker world: two separate files, two separate asks.
+            local qans=""
+            read -r qans || qans=""
+            case "${qans,,}" in y|yes) want_quiet=1 ;; esac
+        fi
     fi
     if [ "$want_quiet" -eq 1 ]; then
-        : > "$OUT/tx-quiet.txt"
-        MARKER_FILES+=("tx-quiet.txt")
-        log "[marker] quiet console enabled (tx-quiet.txt - loader.log stays full)"
-    elif [ "$QUIET" -eq 0 ] && [ -n "$AUTO_RUN" ]; then
-        log "[marker] quiet console not requested (--quiet writes tx-quiet.txt)"
+        if [ "$USE_INI" -eq 1 ]; then
+            INI_LINES+=("output = quiet")
+            log "[ini] quiet console enabled (output = quiet - loader.log stays full)"
+        else
+            : > "$OUT/tx-quiet.txt"
+            MARKER_FILES+=("tx-quiet.txt")
+            log "[marker] quiet console enabled (tx-quiet.txt - loader.log stays full)"
+        fi
+    elif [ "$QUIET" -eq 0 ] && [ -n "$AUTO_RUN" ] && [ "$want_fast" -eq 0 ]; then
+        log "[marker] output profile: normal (default)"
     fi
     # Chain-target pin (issue #204): a handoff-shape declaration, not a GPU
     # knob - the loader falls back to the default chain order when the
@@ -1244,32 +1293,97 @@ marker_offer() {
         fi
     fi
     if [ -n "$chain_path" ]; then
-        printf '%s\n' "$chain_path" > "$OUT/chain-target.txt"
-        MARKER_FILES+=("chain-target.txt")
-        log "[marker] chain pinned: chain-target.txt = $chain_path"
+        if [ "$USE_INI" -eq 1 ]; then
+            INI_LINES+=("chain_target = $chain_path")
+            log "[ini] chain pinned: chain_target = $chain_path"
+        else
+            printf '%s\n' "$chain_path" > "$OUT/chain-target.txt"
+            MARKER_FILES+=("chain-target.txt")
+            log "[marker] chain pinned: chain-target.txt = $chain_path"
+        fi
     fi
-    # Ultrafast profile: the one speed option whose default must stay No -
-    # it skips the diagnostic stages that make a FIRST run debuggable
-    # (M1 sampling, GOP probes, AUTH-SCAN, dumps; bigger log blind spots on
-    # a hang). For sticks rebuilt for machines already verified over
-    # multiple rounds (docs/faq.md). It folds quiet on the loader side, so
-    # tx-quiet.txt next to it is redundant (noted, harmless either way).
-    local want_fast=0
-    if [ "$ULTRAFAST" -eq 1 ]; then
-        want_fast=1
-    elif [ "$menu_interactive" -eq 1 ]; then
-        log "[marker]   ultrafast (tx-ultrafast.txt): skips the diagnostic probes and folds"
-        log "[marker]   quiet - faster boots, bigger log blind spots on a hang. Only for"
-        log "[marker]   machines already verified over multiple rounds (docs/faq.md)."
-        local uans=""
-        read -r uans || uans=""
-        case "${uans,,}" in y|yes) want_fast=1 ;; esac
-    fi
+    # Ultrafast application (the ask above covers it in ini mode; legacy
+    # mode keeps its own second ask because the marker world has two files).
+    # The profile skips the diagnostic stages that make a FIRST run
+    # debuggable (M1 sampling, GOP probes, AUTH-SCAN, dumps), so its ask
+    # default stays No and the docs steer it to rebuilt sticks for machines
+    # already verified over multiple rounds (docs/faq.md).
     if [ "$want_fast" -eq 1 ]; then
-        : > "$OUT/tx-ultrafast.txt"
-        MARKER_FILES+=("tx-ultrafast.txt")
-        log "[marker] ultrafast enabled (tx-ultrafast.txt - verdict read-backs still run)"
-        [ "$want_quiet" -eq 1 ] && log "[marker]   ultrafast folds quiet - tx-quiet.txt alongside is redundant"
+        if [ "$USE_INI" -eq 1 ]; then
+            INI_LINES+=("output = ultrafast")
+            log "[ini] ultrafast enabled (output = ultrafast - verdict read-backs still run)"
+        else
+            : > "$OUT/tx-ultrafast.txt"
+            MARKER_FILES+=("tx-ultrafast.txt")
+            log "[marker] ultrafast enabled (tx-ultrafast.txt - verdict read-backs still run)"
+            [ "$want_quiet" -eq 1 ] && log "[marker]   ultrafast folds quiet - tx-quiet.txt alongside is redundant"
+        fi
+    fi
+    if [ "$USE_INI" -eq 1 ]; then
+        if [ "${#INI_LINES[@]}" -gt 0 ]; then
+            {
+                printf '# \\tx.ini - consolidated stick config (docs/tx-ini.md; marker files stay valid for arms not set here)\r\n'
+                printf '%s\r\n' "${INI_LINES[@]}"
+            } > "$OUT/tx.ini"
+            MARKER_FILES+=("tx.ini")
+            log "[ini] wrote tx.ini with ${#INI_LINES[@]} arm(s): ${INI_LINES[*]}"
+            # Conflict sweep: a marker file whose arm this ini sets turns the
+            # whole boot into an INI-REFUSED refusal (the loader's no-silent-
+            # precedence rule). Old sticks carry last season's markers - list
+            # the conflicting ones and offer deletion (default N; scripted
+            # runs are only warned, never delete unattended). Non-conflicting
+            # markers stay valid fallbacks by design and are left alone.
+            local conflicts=()
+            local arm_set=""
+            for _l in "${INI_LINES[@]}"; do
+                case "$_l" in
+                    i_know_what_i_am_doing*) arm_set="${arm_set}A" ;;
+                    output*) arm_set="${arm_set}O" ;;
+                    chain_target*) arm_set="${arm_set}C" ;;
+                esac
+            done
+            [[ "$arm_set" == *A* ]] && [ -f "$OUT/i_know_what_i_am_doing.txt" ] && conflicts+=("i_know_what_i_am_doing.txt")
+            [[ "$arm_set" == *O* ]] && [ -f "$OUT/tx-quiet.txt" ] && conflicts+=("tx-quiet.txt")
+            [[ "$arm_set" == *O* ]] && [ -f "$OUT/tx-ultrafast.txt" ] && conflicts+=("tx-ultrafast.txt")
+            [[ "$arm_set" == *C* ]] && [ -f "$OUT/chain-target.txt" ] && conflicts+=("chain-target.txt")
+            if [ "${#conflicts[@]}" -gt 0 ]; then
+                warn "[ini] conflicting marker file(s) on the target - an ini arm plus its marker file is a boot refusal (INI-REFUSED): ${conflicts[*]}"
+                if [ "$menu_interactive" -eq 1 ]; then
+                    local dans=""
+                    read -r dans || dans=""
+                    case "${dans,,}" in y|yes)
+                        local cf
+                        for cf in "${conflicts[@]}"; do
+                            rm -f "$OUT/$cf"
+                            log "[ini] deleted stale marker: $cf"
+                        done ;;
+                    *) warn "[ini] kept - the stick will REFUSE to boot until they are removed (fix the lines above)" ;;
+                    esac
+                else
+                    warn "[ini] scripted run - not deleting; remove them manually or the stick will REFUSE to boot (INI-REFUSED)"
+                fi
+            fi
+        else
+            log "[ini] no arms selected - no tx.ini written (all-default stick)"
+        fi
+    else
+        # Legacy shape: a leftover \tx.ini on the target may set arms the
+        # legacy markers do not (and a new-binary boot would see double-set
+        # refusals). Offer the same confirm-delete sweep, default N.
+        if [ -f "$OUT/tx.ini" ]; then
+            warn "[legacy] \\tx.ini present on the target - mixed shapes cause boot refusals (an ini arm plus its marker file double-sets the arm)"
+            if [ "$menu_interactive" -eq 1 ]; then
+                local dans=""
+                read -r dans || dans=""
+                case "${dans,,}" in y|yes)
+                    rm -f "$OUT/tx.ini"
+                    log "[legacy] deleted stale tx.ini" ;;
+                *) warn "[legacy] kept - remove it manually or a new-binary boot may REFUSE (INI-REFUSED)" ;;
+                esac
+            else
+                warn "[legacy] scripted run - not deleting; remove tx.ini manually or a new-binary boot may REFUSE"
+            fi
+        fi
     fi
 }
 marker_offer
