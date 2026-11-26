@@ -5302,8 +5302,12 @@ const FUSE_CMD_MASK: u32 = 0x3;
 /// Bounded busy-wait per row: volatile MMIO reads are ~ns, so 2^20 without
 /// idle means the controller is not following the protocol - abort, not spin.
 const FUSE_SPIN_LIMIT: u32 = 1 << 20;
-/// Address-field sanity cap (envytools-era 9-bit fuse address; GA100 512).
-/// A Turing dump without readable IFF gets this as its hard bound.
+/// Address-field sanity cap for dies with NO readable IFF (envytools-era
+/// 9-bit fuse address; GA100 512). Dies WITH a readable IFF_RECORD use the
+/// per-die decoded bound instead - Ada IFF reaches row 831 (0x33f), and a
+/// hardcoded 512 here aborted exactly the AD102 IFF-pool capture it was
+/// meant to guard (issue #237 round 9: FUSEROWS 831 outside the 512-row
+/// address field).
 const FUSE_MAX_ROWS: u32 = 512;
 
 fn fuse_ctrl(base: u32) -> u32 { base }
@@ -5411,13 +5415,9 @@ fn fuse_row_dump(
         println!("  {} FUSEADDR {saved:#010x} unreadable - no writes performed", red("FUSEROWS ABORT:"));
         return (Vec::new(), false);
     }
-    if saved >= FUSE_MAX_ROWS {
-        println!(
-            "  {} FUSEADDR {saved} outside the {FUSE_MAX_ROWS}-row address field - controller not in the expected state, no writes performed",
-            red("FUSEROWS ABORT:")
-        );
-        return (Vec::new(), false);
-    }
+    // IFF first: the per-die decoded bound is the sane pre-check for the
+    // resting FUSEADDR - a hardcoded 512-row cap aborted Ada's 832-row
+    // domain at the exact capture it exists to enable (issue #237 round 9).
     let iff = rd(fuse_iff(base));
     let iff_readable = !(iff & 0xffff0000 == 0xbadf0000 || iff == 0xFFFF_FFFF);
     let (first, last_row) = if iff_readable {
@@ -5432,15 +5432,32 @@ fn fuse_row_dump(
         match range {
             None => (0, last),
             Some((a, b)) if b <= last => (a, b),
+            // Explicit over-domain range: read-class, rows past LAST come
+            // back junk (or mirror), never harm - the latch check still
+            // catches a controller that refuses addresses. Owner bench
+            // question (issue #237 round 9 follow-up): let it through with
+            // a loud notice instead of refusing.
             Some((a, b)) => {
-                println!("  {} range {a:#x}-{b:#x} exceeds the IFF domain 0..{last}", red("FUSEROWS ABORT:"));
-                return (Vec::new(), false);
+                println!(
+                    "  {}: explicit range {a:#x}-{b:#x} extends past the IFF domain 0..{last} - out-of-domain rows read junk, not harm",
+                    red("FUSEROWS DEGRADED:")
+                );
+                (a, b)
             }
         }
     } else {
-        // No IFF on this die: domain unverified. An explicit range is
-        // mandatory; out-of-domain rows read junk, not harm (read-class),
-        // and the latch check catches a controller that refuses addresses.
+        // No IFF on this die: domain unverified. The resting FUSEADDR gets
+        // only the conservative cap (no per-die bound exists to check it
+        // against), an explicit range is mandatory; out-of-domain rows read
+        // junk, not harm (read-class), and the latch check catches a
+        // controller that refuses addresses.
+        if saved >= FUSE_MAX_ROWS {
+            println!(
+                "  {} FUSEADDR {saved} outside the {FUSE_MAX_ROWS}-row address cap (IFF unreadable, no per-die bound) - controller not in the expected state, no writes performed",
+                red("FUSEROWS ABORT:")
+            );
+            return (Vec::new(), false);
+        }
         let Some((a, b)) = range else {
             println!("  {} IFF_RECORD {iff:#010x} unreadable and no explicit range given - pass --fuserows=A-B (capped at {FUSE_MAX_ROWS} rows); no writes performed", red("FUSEROWS ABORT:"));
             return (Vec::new(), false);
@@ -5524,9 +5541,61 @@ fn fuse_row_dump(
         }
     }
     for (i, &v) in passes[0].iter().enumerate() {
-        println!("FUSEROW {:#x} = {}", first + i as u32, hx32(v));
+        // IFF op-grammar annotation (issue #237 round 10): the pool words are
+        // an op stream - op = w & 0x3f (0x3d = 2-word WRITE_IMM, 0x3c =
+        // 3-word RMW_MODIFY), addr = (w & 0xffffffc0) >> 4. Decoding runs as
+        // a sequential stream over the captured rows; each printed row gets
+        // its role in the current op. Verified across five dies (AD102
+        // reporter decode + AD107/GA106/TU106/TU117 archives): the CYA_0_DISG2
+        // RMW is bit-identical on three, the PLM writes group per generation.
+        // One open rule: pool-boundary prologue words (AD107 0x2ff) - such
+        // heads print as bare words with no annotation.
+        let ann = iff_op_annotate(&passes[0], i, v);
+        match ann {
+            Some(a) => println!("FUSEROW {:#x} = {}   {}", first + i as u32, hx32(v), a),
+            None => println!("FUSEROW {:#x} = {}", first + i as u32, hx32(v)),
+        }
     }
     (passes[0].iter().enumerate().map(|(i, &v)| (first + i as u32, v)).collect(), complete)
+}
+
+/// Role of row `i` (value `v`) in the sequential IFF op stream `rows`.
+/// Walks from the row start resyncing at every op head, so an
+/// undecodable head only orphans itself, never a whole window. None =
+/// this row is not part of any complete op in the stream (bare padding
+/// or a pool-prologue word).
+fn iff_op_annotate(rows: &[u32], i: usize, v: u32) -> Option<String> {
+    let op = v & 0x3f;
+    if op != 0x3d && op != 0x3c {
+        // Potential operand of a preceding op head: find a resync point.
+        // Scan back at most 3 (longest op) for a head whose operand window
+        // covers i, taking the LATEST such head (stream order).
+        let mut covered: Option<(usize, String)> = None;
+        let lo = i.saturating_sub(2);
+        for h in lo..i {
+            let hw = rows.get(h).copied().unwrap_or(0);
+            let hop = hw & 0x3f;
+            let haddr = (hw & 0xffffffc0) >> 4;
+            let len = if hop == 0x3d { 2 } else if hop == 0x3c { 3 } else { 0 };
+            if len > 0 && h + len > i {
+                // i is an operand of the head at h - but only valid if the
+                // head itself was in-stream (annotated by recursion of the
+                // same rule). Mark the operand role.
+                let which = if i == h + 1 {
+                    if hop == 0x3d { "value" } else { "and-mask" }
+                } else {
+                    "or-mask"
+                };
+                covered = Some((h, format!("[{} of {} {:#010x}]", which,
+                    if hop == 0x3d { "WRITE_IMM" } else { "RMW" }, haddr)));
+            }
+        }
+        return covered.map(|(_, s)| s);
+    }
+    // Op head: label it with the address it targets. Operands print via the
+    // back-scan above when their turn comes.
+    let addr = (v & 0xffffffc0) >> 4;
+    Some(format!("[{} {:#010x}]", if op == 0x3d { "WRITE_IMM" } else { "RMW" }, addr))
 }
 
 fn validate_prom_bit_flags(prom_bit: bool, reapply: bool, fuserows: bool, has_pokes: bool) -> Result<(), &'static str> {
