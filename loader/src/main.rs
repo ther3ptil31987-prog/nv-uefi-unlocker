@@ -154,7 +154,16 @@ fn main() -> Status {
     // have bound the filesystem surface partially, and #122's 14% early
     // hang logs nothing after the banner - a failed SFS path would look
     // exactly like that. Idempotent; NVIDIA display handles stay skipped.
-    chainload::reconnect_block_devices("EARLY");
+    // D#297 ablation knob: the EARLY pass is one of the two pre-surgery
+    // actions v2.1.5 never ran (the wedge machine boots fine through L7's
+    // abort round WITH the pass, so the pass alone is innocent - the
+    // arm x EARLY interaction is the suspect). \tx-no-early-reconnect.txt
+    // skips it for one boot; the CHAIN pass still runs its half.
+    if config::probe("\\tx-no-early-reconnect.txt") {
+        info!("EARLY: \\tx-no-early-reconnect.txt present - reconnect pass SKIPPED this boot (D#297 ablation; the CHAIN pass still runs, bootmgfw chain may see partially bound volumes)");
+    } else {
+        chainload::reconnect_block_devices("EARLY");
+    }
 
     // Phase: ACPI-DUMP (\tx-acpi-dump.txt, read-only). Runs before the
     // confirm so an aborted run still produces the tables; independent of
@@ -196,15 +205,24 @@ fn main() -> Status {
     }
     // CONFIRM 之前一次性处理输入:复位/排空/(可选)USB 端口复位/安静窗口。
     // 此时还没有中止窗口,被持续上报的键(如鼠标的键盘接口)不会中止倒计时。
+    // D#297 ablation knob: the ConIn reset is the second pre-surgery action
+    // v2.1.5 never ran (\tx-no-input-settle.txt skips it). WARNING on that
+    // path: the ghost-Esc suppression is skipped too - on machines with a
+    // phantoming keyboard/EC the armed countdown can be aborted mid-count
+    // by a ghost Esc (CONFIRM: ... ABORT, zero GPU writes); just rerun.
     let usb_list = config::content(config::ContentArm::InputReset).map(|c| usbreset::parse(&c));
     if let Some(l) = &usb_list {
         info!("USB-RESET: input-reset.txt present - {} device(s) listed", l.len());
     }
-    keywait::settle_input_once(|| {
-        if let Some(l) = &usb_list {
-            usbreset::reset_listed(l);
-        }
-    });
+    if config::probe("\\tx-no-input-settle.txt") {
+        info!("INPUT-SETTLE: \\tx-no-input-settle.txt present - ConIn reset/drain/settle SKIPPED this boot (D#297 ablation; ghost-Esc suppression is OFF - an armed round may abort on a phantom Esc, rerun if so)");
+    } else {
+        keywait::settle_input_once(|| {
+            if let Some(l) = &usb_list {
+                usbreset::reset_listed(l);
+            }
+        });
+    }
     let confirmed = if let Some(secs) = config::armed() {
         info!(
             "CONFIRM: armed mode (i_know_what_i_am_doing, marker or tx.ini) - {secs}s countdown auto-runs, ANY key aborts"
