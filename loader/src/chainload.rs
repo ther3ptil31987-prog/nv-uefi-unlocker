@@ -82,7 +82,20 @@ pub fn chain_load_bootmgfw(pre: Option<PreloadedOsLoader>) -> Result<()> {
     // builds only - non-tx builds never fill the cache.
     #[cfg(feature = "tx")]
     crate::tx::handoff_free_assets();
-    log_handoff_memmap();
+    // D#297 ablation knob: the handoff MEMMAP dump and the BootOrder/Boot####
+    // dump are rc-only additions v2.1.5 never ran. Both COMPLETED before the
+    // wedge in every wedged round (their output is on the stick), so they are
+    // weak suspects - but they were the reporter's named residual delta and
+    // had no switch. \tx-no-chain-dumps.txt skips both dumps; the
+    // firmware-resolve (Pass 0.5) stays functional, its per-entry dump lines
+    // go with the dump.
+    let chain_dumps = !crate::config::probe("\\tx-no-chain-dumps.txt");
+    if !chain_dumps {
+        info!("CHAIN: \\tx-no-chain-dumps.txt present - MEMMAP + BootOrder dumps SKIPPED this boot (D#297 ablation)");
+    }
+    if chain_dumps {
+        log_handoff_memmap();
+    }
     // Operator pin: exit to the firmware boot manager instead of
     // LoadImage/StartImage. On platforms where a chain-loaded bootmgfw
     // mis-resolves its BCD (MSI/AMI GP66: "File: \BCD, 0xc0000034"),
@@ -98,7 +111,9 @@ pub fn chain_load_bootmgfw(pre: Option<PreloadedOsLoader>) -> Result<()> {
         }
         info!("CHAIN: preloaded start failed - falling back to the post-transaction volume scan");
     }
-    log_firmware_boot_order();
+    if chain_dumps {
+        log_firmware_boot_order();
+    }
     chain_load_bootmgfw_inner()
 }
 

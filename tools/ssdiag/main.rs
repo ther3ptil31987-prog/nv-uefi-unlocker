@@ -5485,8 +5485,21 @@ fn fuse_row_dump(
                 break 'passes;
             }
             wr(fuse_addr(base), row);
-            if rd(fuse_addr(base)) != row {
-                fail = Some(format!("pass {} row {row}: FUSEADDR did not latch", p + 1));
+            if rd(fuse_addr(base)) != row && row != 0 {
+                // Distinguish the two failure shapes: a PLM-gated fuse block
+                // (GB20x: FUSECTRL_PLM write nibble closes PL0 - host writes
+                // dropped, row 0 only "works" because the resting address
+                // already is 0) vs a controller-state anomaly.
+                let fcp = rd(base + 0xF8);
+                let fcp_readable = !(fcp & 0xffff0000 == 0xbadf0000 || fcp == 0xFFFF_FFFF);
+                if fcp_readable && (fcp >> 4) & 1 == 0 {
+                    fail = Some(format!(
+                        "pass {} row {row}: FUSEADDR did not latch - FUSECTRL_PLM {fcp:#010x} has PL0-write CLOSED: the fuse-block registers are PLM-gated against host writes (observed on GB20x professional parts; the row dump needs a controller with host-write enabled, e.g. GA10x/Turing)",
+                        p + 1
+                    ));
+                } else {
+                    fail = Some(format!("pass {} row {row}: FUSEADDR did not latch", p + 1));
+                }
                 break 'passes;
             }
             wr(fuse_ctrl(base), FUSE_CMD_READ);
@@ -5595,7 +5608,27 @@ fn iff_op_annotate(rows: &[u32], i: usize, v: u32) -> Option<String> {
     // Op head: label it with the address it targets. Operands print via the
     // back-scan above when their turn comes.
     let addr = (v & 0xffffffc0) >> 4;
-    Some(format!("[{} {:#010x}]", if op == 0x3d { "WRITE_IMM" } else { "RMW" }, addr))
+    // Semantic tag for the known-target heads (issue #237 rounds 10-11):
+    // the pool writes PLM-class registers with classic permission values,
+    // the PJTAG priv-content chain, and a few recurring config registers.
+    // Unknown addresses stay untagged - the tag is a reading aid, not a
+    // decode claim.
+    let tag = if op == 0x3d {
+        match addr {
+            // PLM writes: the value operand is a classic permission word
+            0x0000e224 | 0x00021068 | 0x00118fec | 0x00118ffc => " (PLM)",
+            // GC6_AON pair, always <- 0 in the observed pools
+            0x0011839c | 0x001183a0 => " (GC6_AON)",
+            _ => "",
+        }
+    } else {
+        match addr {
+            // CYA_0_DISG2 close: bit-identical mask on AD102/AD107/GA106
+            0x0008c2c0 => " (CYA_0_DISG2)",
+            _ => "",
+        }
+    };
+    Some(format!("[{} {:#010x}{}]", if op == 0x3d { "WRITE_IMM" } else { "RMW" }, addr, tag))
 }
 
 fn validate_prom_bit_flags(prom_bit: bool, reapply: bool, fuserows: bool, has_pokes: bool) -> Result<(), &'static str> {

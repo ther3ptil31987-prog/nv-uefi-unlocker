@@ -106,9 +106,10 @@ fn read_ini() -> IniRead {
     IniRead::Content(out)
 }
 
-/// Open-only presence probe (same shape as `tx::probe_file`, kept local so
-/// this module stays ungated like its callers in read-only builds).
-fn probe(path: &str) -> bool {
+/// Open-only presence probe (same shape as `tx::probe_file`, kept here so
+/// this module stays ungated like its callers in read-only builds — the
+/// D#297 chain-phase ablation knobs in main/chainload use it too).
+pub(crate) fn probe(path: &str) -> bool {
     let Ok(path_c) = CString16::try_from(path) else {
         return false;
     };
