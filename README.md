@@ -557,9 +557,7 @@ TU102/GA102/AD102 三张金标逐字节复现；GTX 16 系（TU116）是第一�
   [Reddit/r/tomshardware](https://www.reddit.com/r/tomshardware/comments/1xl6s42/opensource_usb_tool_unlocks_nvidias_halfspeed_gpu/)（EN） ·
   [Reddit/r/HighVRAMHardwareWatch](https://www.reddit.com/r/HighVRAMHardwareWatch/comments/1xltzjg/opensource_usb_tool_unlocks_nvidias_halfspeed_gpu/)（EN） ·
   [Facebook/Tom's Hardware](https://www.facebook.com/tomshardware/posts/an-open-source-uefi-tool-nv-uefi-unlocker-lifts-nvidias-tensor-rate-cap-on-rtx-2/1542242557940157/)（EN） ·
-  [小众软件](https://www.appinn.com/nvidia-gpu-ai-compute-unlock/)（ZH） ·
   [什么值得买「你的RTX一直"虚标半速"？这张U盘撬开了老黄的算力锁」](https://post.smzdm.com/p/aqrzlpev/)（ZH） ·
-  [腾讯新闻「老黄刀法失守！民间大神接力破解RTX 30」](https://news.qq.com/rain/a/20261027A08B6I00)（ZH） ·
   [GitCode 博客「nv-uefi-unlocker 的社区谱系与技术致谢」](https://blog.gitcode.com/378fd52307292b3b145d70b50deba70b.html)（ZH） ·
   [CSDN 博客「解锁后如何确认生效？性能验证全攻略」](https://blog.csdn.net/gitblog_00215/article/details/161440400)（ZH） ·
   [搜狐/简明科学指南「RTX显卡性能提升75%」](https://m.sohu.com/a/1096476767_120573081)（ZH） ·
@@ -570,7 +568,6 @@ TU102/GA102/AD102 三张金标逐字节复现；GTX 16 系（TU116）是第一�
   [YouTube/Dofu AI](https://www.youtube.com/watch?v=O8pV33e3_AY)（EN） ·
   [YouTube/Swarowsky Tech](https://www.youtube.com/watch?v=4IJes3iL2Os)（EN，1万+ 次观看） ·
   [YouTube/Star_Owal](https://www.youtube.com/watch?v=uOJfnTNOm1U)（ZH-TW） ·
-  [YouTube/thecodebear](https://www.youtube.com/watch?v=pnT4YYhdZb8)（EN，6.8万+ 次观看） ·
   [YouTube/terminal-max（Shorts）](https://www.youtube.com/shorts/Uu8vnPtKroM)（EN）
 
 ## Star History
